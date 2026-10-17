@@ -315,9 +315,12 @@ func TestSidecarOpaqueBridgeAlwaysDialsOneFixedTargetAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestSidecarTicketStreamBudgetIsLifetimeBound(t *testing.T) {
+// openOneStreamSession connects a client whose ticket allows a one-stream
+// burst and serves it, returning the local endpoint and a dial counter.
+func openOneStreamSession(t *testing.T, refill float64, jti string) (*sidecarFixture, string, *atomic.Int32) {
+	t.Helper()
 	target := startEchoTarget(t)
-	var dialCount atomic.Int32
+	dialCount := &atomic.Int32{}
 	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
 		opts.FixedTarget = target.Addr().String()
 		opts.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -325,8 +328,9 @@ func TestSidecarTicketStreamBudgetIsLifetimeBound(t *testing.T) {
 			return (&net.Dialer{}).DialContext(ctx, network, address)
 		}
 		opts.NoStreamIdleTimeout = time.Minute
+		opts.StreamRefillPerSecond = refill
 	})
-	claims := validClaims(fixture.now, "relay-a", "front-a", "one-stream-ticket-00000001")
+	claims := validClaims(fixture.now, "relay-a", "front-a", jti)
 	claims.MaxStreams = 1
 	ticket, err := fixture.signer.Sign(claims)
 	if err != nil {
@@ -337,53 +341,144 @@ func TestSidecarTicketStreamBudgetIsLifetimeBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
 	serveCtx, cancelServe := context.WithCancel(context.Background())
-	defer cancelServe()
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- client.Serve(serveCtx) }()
-
+	t.Cleanup(func() {
+		cancelServe()
+		_ = client.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+			t.Error("client Serve did not stop")
+		}
+	})
 	host, port := client.Endpoint()
-	endpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	first, err := net.Dial("tcp", endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := first.Write([]byte("first")); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len("first"))
-	if _, err := io.ReadFull(first, got); err != nil {
-		t.Fatal(err)
-	}
-	_ = first.Close()
-	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+	return fixture, net.JoinHostPort(host, fmt.Sprint(port)), dialCount
+}
 
-	second, err := net.Dial("tcp", endpoint)
+// echoOnce reports whether one stream through the session echoed its payload.
+func echoOnce(t *testing.T, endpoint, payload string) bool {
+	t.Helper()
+	conn, err := net.Dial("tcp", endpoint)
 	if err != nil {
-		t.Fatal(err)
+		return false
 	}
-	_ = second.SetDeadline(time.Now().Add(time.Second))
-	_, _ = second.Write([]byte("second"))
-	buffer := make([]byte, 1)
-	if _, err := second.Read(buffer); err == nil {
-		t.Fatal("stream beyond ticket lifetime budget remained open")
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		return false
 	}
-	_ = second.Close()
+	got := make([]byte, len(payload))
+	_, err = io.ReadFull(conn, got)
+	return err == nil && string(got) == payload
+}
+
+func TestSidecarStreamBudgetRefusesExcessWithoutEndingSession(t *testing.T) {
+	fixture, endpoint, dialCount := openOneStreamSession(t, 0.001, "one-stream-ticket-00000001")
+	if !echoOnce(t, endpoint, "first") {
+		t.Fatal("first stream within the burst failed")
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+	if echoOnce(t, endpoint, "second") {
+		t.Fatal("stream beyond the drained budget was carried")
+	}
 	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.StreamLimitRejections == 1 })
 	if got := dialCount.Load(); got != 1 {
-		t.Fatalf("ticket with max_streams=1 caused %d loopback dials", got)
+		t.Fatalf("drained budget caused %d loopback dials", got)
 	}
+	// Refusing the excess stream must leave the session itself in place.
+	time.Sleep(100 * time.Millisecond)
+	if snapshot := fixture.stats.Snapshot(); snapshot.CurrentSessions != 1 {
+		t.Fatalf("current sessions = %d after a refused stream, want 1", snapshot.CurrentSessions)
+	}
+}
 
-	cancelServe()
-	_ = client.Close()
-	select {
-	case err := <-serveDone:
+func TestSidecarEndsSessionWhenRefusedStreamsAreNeverClosed(t *testing.T) {
+	fixture := newSidecarFixture(t, func(opts *SidecarOptions) {
+		opts.FixedTarget = startEchoTarget(t).Addr().String()
+		opts.NoStreamIdleTimeout = time.Minute
+		opts.StreamRefillPerSecond = 0.001
+	})
+	claims := validClaims(fixture.now, "relay-a", "front-a", "one-stream-ticket-00000003")
+	claims.MaxStreams = 1
+	ticket, err := fixture.signer.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := sidecarEdge(t, fixture.handler, testOriginOld, "198.51.100.14:443")
+	options := sidecarClientOptions(edge, ticket)
+	dialer := options.WebSocketDialer
+	dialer.TLSClientConfig = options.TLSConfig
+	dialer.Subprotocols = []string{Subprotocol}
+	header := http.Header{}
+	header.Set(wsscore.TicketAuthorizationHeader, wsscore.TicketBearerPrefix+ticket)
+	ws, _, err := dialer.DialContext(t.Context(), edge.URL, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := wsscore.NewWebSocketConn(ws, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := wsscore.NewClientSession(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 1 })
+
+	// Open refused streams and never close them, so each one stays tracked
+	// on the sidecar until its close timeout. Past the bound's allowance for a
+	// cooperating client, the sidecar must end the session.
+	for i := 0; i < 2*yamuxAcceptBacklog && !session.IsClosed(); i++ {
+		stream, err := session.Open()
 		if err != nil {
-			t.Fatalf("Serve cleanup: %v", err)
+			break
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("client Serve did not stop")
+		_, _ = stream.Write([]byte{0})
+		time.Sleep(time.Millisecond)
+	}
+	waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentSessions == 0 })
+}
+
+func TestSidecarCooperativeBurstKeepsSession(t *testing.T) {
+	fixture, endpoint, _ := openOneStreamSession(t, 0.001, "one-stream-ticket-00000004")
+	var wg sync.WaitGroup
+	var carried atomic.Int32
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if echoOnce(t, endpoint, fmt.Sprintf("burst-%d", i)) {
+				carried.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if carried.Load() == 0 {
+		t.Fatal("no stream in the burst was carried")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if snapshot := fixture.stats.Snapshot(); snapshot.CurrentSessions != 1 {
+		t.Fatalf("current sessions = %d after a cooperative burst, want 1", snapshot.CurrentSessions)
+	}
+}
+
+func TestSidecarStreamBudgetRefills(t *testing.T) {
+	fixture, endpoint, dialCount := openOneStreamSession(t, 50, "one-stream-ticket-00000002")
+	for i := range 3 {
+		if !echoOnce(t, endpoint, fmt.Sprintf("stream-%d", i)) {
+			t.Fatalf("stream %d after refill failed", i)
+		}
+		waitSnapshot(t, fixture.stats, func(s SidecarSnapshot) bool { return s.CurrentStreams == 0 })
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := dialCount.Load(); got != 3 {
+		t.Fatalf("loopback dials = %d, want 3", got)
+	}
+	if snapshot := fixture.stats.Snapshot(); snapshot.StreamLimitRejections != 0 || snapshot.CurrentSessions != 1 {
+		t.Fatalf("stream limit rejections = %d, current sessions = %d", snapshot.StreamLimitRejections, snapshot.CurrentSessions)
 	}
 }
 

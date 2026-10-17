@@ -175,6 +175,42 @@ matching public keys, so production must run the operator's active seed; the
 startup log line `relay list signing enabled key_id=…` and the `signing_key_id`
 field on `/healthz` confirm which key is live.
 
+## Client user authentication
+
+Client enrollment and authentication (`POST /api/v1/users/challenge` and
+`POST /api/v1/users/auth`, see `docs/api.md`) are optional and switch on with
+`OPENRUNG_USER_TOKEN_KEY`: the standard base64 of a 32-byte HMAC key that
+signs the access tokens the broker hands authenticated clients. Generate it
+like the other seeds and keep it in the root-owned mode-`0600` env file:
+
+```sh
+openssl rand -base64 32
+```
+
+Only the broker ever reads the key, so it is never handed to relays or
+clients. Rotating it invalidates every outstanding access token at once;
+clients then re-authenticate on their next connect. Do not reuse any other
+broker credential for it; startup refuses a value shared with
+`OPENRUNG_API_TOKEN`. With the key set, the operational user routes
+(`GET /admin/api/users/{id}`, `PUT /admin/api/users/{id}/status`) also
+appear when `OPENRUNG_API_TOKEN` is configured; disabling a user there is the
+revocation lever. The user tables live in the relay database
+(`OPENRUNG_RELAY_STORE=postgres`); the memory store also supports them but
+forgets every user on restart.
+
+Relays that register with the `access_leases` capability (standalone relay
+0.3.0 and later, and the volunteer desktop app on the same engine, in direct
+mode with credential rotation) synchronise broker-issued per-client
+credentials through `GET /api/v1/relays/{id}/leases` and its `ack`
+endpoint; see `docs/api.md`. Those routes need no extra configuration — they
+authenticate with each registration's lease token — and `GET
+/admin/api/leases/{id}` resolves a relay-log label to its user once
+`OPENRUNG_API_TOKEN` is set. `OPENRUNG_ACCESS_LEASE_TTL`,
+`OPENRUNG_MAX_LEASES_PER_USER` and `OPENRUNG_MAX_LEASES_PER_RELAY` tune the
+lease lifetime and caps. Deploy the broker before updating relays: the
+capability is recorded at registration, and a relay only starts its syncer
+when the broker echoes it.
+
 ## WSS ticket signing and relay public-key handoff
 
 WSS ticket signing is optional and uses a dedicated Ed25519 key. Set
@@ -441,6 +477,13 @@ docker inspect openrung-broker \
 | `OPENRUNG_FOUNDATION_TOKEN`          | no       | —                                   | Privileged token for `node_class=foundation` registrations; must differ from the volunteer token |
 | `OPENRUNG_RELAY_SIGNING_KEY`         | yes      | —                                   | Std-base64 32-byte Ed25519 seed; signs every relay-list response |
 | `OPENRUNG_WSS_TICKET_SIGNING_SEED`   | no       | —                                   | Dedicated std-base64 32-byte Ed25519 seed; enables relay/front-bound WSS tickets |
+| `OPENRUNG_USER_TOKEN_KEY`            | no       | —                                   | Dedicated std-base64 32-byte HMAC key; enables client user authentication (`/api/v1/users/*`) and the operational user routes; must differ from every other credential |
+| `OPENRUNG_ACCESS_TOKEN_TTL`          | no       | `24h`                               | Lifetime of client access tokens (`1m`–`168h`)                 |
+| `OPENRUNG_ENROLLMENT_BURST_LIMIT`    | no       | `3`                                 | New user identities per source address (IPv6: /64) per hour; negative disables |
+| `OPENRUNG_ENROLLMENT_DAILY_LIMIT`    | no       | `10`                                | New user identities per source address per 24 h; negative disables |
+| `OPENRUNG_ACCESS_LEASE_TTL`          | no       | `1h`                                | Lifetime of a per-client relay credential (access lease) without renewal (`1m`–`24h`) |
+| `OPENRUNG_MAX_LEASES_PER_USER`       | no       | `10`                                | Live access leases one user may hold across the fleet; the least recently renewed are revoked at the cap |
+| `OPENRUNG_MAX_LEASES_PER_RELAY`      | no       | `2000`                              | Live access leases one relay may hold; a relay at the cap is skipped by issuance |
 | `OPENRUNG_DASHBOARD_TOKEN`           | no       | —                                   | Enables the protected `/admin/telemetry` dashboard             |
 | `OPENRUNG_API_TOKEN`                 | no       | —                                   | Enables `/admin/api/relays/inventory` and the ranking-weight endpoints; must differ from every other credential |
 | `OPENRUNG_ADDR`                      | no       | `:8080`                             | HTTP listen address                                            |

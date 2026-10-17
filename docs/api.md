@@ -5,7 +5,8 @@ All API paths are currently versioned under `/api/v1`.
 ## Abuse limits
 
 The unauthenticated endpoints (`GET /api/v1/relays`, `POST
-/api/v1/wss/tickets`, `POST /api/v1/telemetry/events`, and `GET
+/api/v1/wss/tickets`, `POST /api/v1/users/challenge`, `POST
+/api/v1/users/auth`, `POST /api/v1/telemetry/events`, and `GET
 /api/v1/speed-test`) are rate limited. Requests over the budget receive `429
 Too Many Requests` with a `Retry-After` header (seconds); clients should back
 off and retry only within their bounded operation deadline. Most endpoints use
@@ -582,9 +583,21 @@ Request:
   "max_mbps": 100,
   "relay_version": "relay/0.1.0",
   "transport": "direct",
-  "node_class": "volunteer"
+  "node_class": "volunteer",
+  "access_leases": true
 }
 ```
+
+`access_leases` (optional, default `false`) declares that the relay installs
+broker-issued per-client credentials through the [relay lease
+sync](#relay-lease-sync) endpoints. It is a registration-time capability
+only — heartbeats never carry it and the identity statement does not bind it
+— and it is honoured only for identity-bearing registrations, because the sync
+endpoints authenticate with the registration's `lease_token`. The response
+echoes the recorded value as `access_leases` (absent when `false`); a relay
+starts its lease syncer only when the echo is present, so a broker that
+predates leases leaves the relay serving the shared credential alone. The
+capability is private registration state and never appears in relay lists.
 
 `relay_version` identifies the relay runtime artifact, independently of the
 broker, relay hub, and client app versions. Standalone images report values such
@@ -793,6 +806,7 @@ Response:
 {
   "id": "relay_...",
   "lease_token": "lease_<opaque random token>",
+  "access_leases": true,
   "public_host": "2001:db8::1",
   "public_port": 443,
   "city": "Tokyo",
@@ -887,6 +901,110 @@ bounded clock-skew
 allowance has elapsed. Until then a snapshot can still show the earlier
 `foundation` provenance, so removing the origin row is not an instant
 client-visible revocation mechanism.
+
+## Relay lease sync
+
+```http
+GET /api/v1/relays/{id}/leases
+GET /api/v1/relays/{id}/leases?after=<revision>
+POST /api/v1/relays/{id}/leases/ack
+Authorization: Bearer <lease_token from registration>
+```
+
+Access leases are broker-issued, short-lived VLESS credentials for one client
+installation on one relay (ADR-006). A relay that registered with
+`access_leases` keeps its xray in step with the broker's desired set through
+these two endpoints. Both authenticate with the registration's `lease_token`
+— not the registration token — and both answer `404 relay not found` for a
+missing or superseded token, an unknown relay, or a legacy identityless
+registration, so the relay's ordinary heartbeat re-registration path takes
+over and the next poll uses the new token.
+
+The poll returns the relay's **full** desired set and its revision in one
+consistent snapshot:
+
+```json
+{
+  "server_time": "2026-10-16T12:00:00Z",
+  "revision": 42,
+  "leases": [
+    {
+      "id": "0123456789abcdef0123456789abcdef",
+      "credential": "2c08df10-4ef4-4ab9-95c6-cb1e94cdb2ff",
+      "expires_at": "2026-10-16T13:00:00Z"
+    }
+  ]
+}
+```
+
+`revision` is a per-relay counter that advances by one on every change to the
+set — a lease issued, renewed, revoked or evicted — and every lease carries
+the revision of its last change, so a set served at revision *N* contains
+exactly the live leases changed at or before *N*. Leases never carry user
+identity; relays only ever see the lease ID, which they use as the xray user
+label `lease-<id>`. Expiry is relative: a relay removes a lease at
+`now + (expires_at − server_time)` on its own clock, so a clock offset between
+broker and relay never shifts the window, and a lease the broker never revoked
+still ends on time through a broker outage.
+
+Without `after` the broker answers immediately, even with an empty set at
+revision `0` — the first poll of a session, which the relay acknowledges
+before it goes online so nothing is ever released against a set it has not
+installed. With `after=N` (the revision the relay last applied) the broker
+holds the request for up to 20 s until its revision exceeds *N*, then answers;
+when nothing changes within the hold it answers with the unchanged set and the
+relay simply polls again, so an idle relay never busy-loops. `after` must be a
+non-negative integer (`400` otherwise).
+
+The ack body is `{"revision": 42}` and the response is `204`. A relay
+acknowledges a revision only after every xray add and remove for that set
+succeeded; a partial result is retried with a fresh full poll instead. The
+broker records the highest acknowledged revision per relay and only ever
+raises it. A registration that mints a new `lease_token` (first registration,
+endpoint move, re-registration after the lease expired) resets the
+acknowledged revision to `0` while keeping the revision counter, so the
+relay's next full poll re-installs every live lease — leases outlive relay
+descriptors, and so does the per-relay revision state.
+
+Issuance is bounded: a user holds at most `OPENRUNG_MAX_LEASES_PER_USER`
+(default 10) live leases — at the cap the least recently renewed leases
+outside the current request are revoked to make room — and a relay holds at
+most `OPENRUNG_MAX_LEASES_PER_RELAY` (default 2000); a relay at its cap is
+skipped. Leases live for `OPENRUNG_ACCESS_LEASE_TTL` (default `1h`, between
+`1m` and `24h`); renewal extends the same credential rather than minting a
+new one. Expired and revoked leases stay resolvable through the operational
+API for seven days.
+
+### Operational lease lookup
+
+```http
+GET /admin/api/leases/{id}
+Authorization: Bearer <OPENRUNG_API_TOKEN>
+```
+
+Resolves a relay-log label to its lease. `{id}` is the bare lease ID or the
+label as logged (`lease-<id>`). The view never includes the credential:
+
+```json
+{
+  "lease_id": "0123456789abcdef0123456789abcdef",
+  "label": "lease-0123456789abcdef0123456789abcdef",
+  "user_id": "user_0123456789abcdef0123456789abcdef",
+  "relay_id": "relay_0123456789abcdef0123456789abcdef",
+  "status": "live",
+  "created_at": "2026-10-16T12:00:00Z",
+  "renewed_at": "2026-10-16T12:30:00Z",
+  "expires_at": "2026-10-16T13:30:00Z",
+  "revision": 42
+}
+```
+
+`status` is `live`, `expired` or `revoked` (with `revoked_at`). Disabling the
+user through `PUT /admin/api/users/{id}/status` revokes every live lease the
+user holds in the same transaction and wakes the affected relays' polls, so
+the credentials are removed within one relay sync. Unknown, malformed and
+retention-expired IDs are `404`; the route shares the operational API's
+limiter and exists when `OPENRUNG_API_TOKEN` is configured.
 
 ## List Relays
 
@@ -996,6 +1114,132 @@ Clients must use fronts only from a fresh, verified directory response. A front
 belongs to the descriptor containing it; clients must never copy a URL to
 another relay. Unknown protocol versions are ignored, preserving direct
 Reality compatibility for older clients and newer front protocols.
+
+## Client users (spec `openrung-user-auth-v1`)
+
+Every client installation can hold a P-256 ECDSA keypair and authenticate it
+to the broker. The broker mints a random, stable user ID for a public key the
+first time it sees it and returns the same ID on every later authentication,
+so there is no separate enrollment step. Operators can disable a user; a
+disabled user still authenticates (so the client learns its state) but
+receives no access token, and every later authorization refuses it. These
+endpoints exist only when `OPENRUNG_USER_TOKEN_KEY` is configured.
+
+User IDs are deliberately independent of telemetry identifiers: clients must
+not send `X-OpenRung-Client-ID` / `X-OpenRung-Session-ID` on these requests,
+and the broker never logs public keys, challenges, signatures or tokens.
+
+### Challenge
+
+```http
+POST /api/v1/users/challenge
+```
+
+Returns `201 Created` with a single-use challenge valid for one minute:
+
+```json
+{
+  "challenge": "Zm9yLWV4YW1wbGUtb25seS1ub3QtcmVhbC1kYXRh",
+  "expires_at": "2026-10-16T12:01:00Z"
+}
+```
+
+Challenges live in broker memory. A broker restart forgets outstanding
+challenges; the client then simply requests another. Under extreme load the
+endpoint answers `503` with `Retry-After` rather than growing without bound.
+
+### Authenticate
+
+```http
+POST /api/v1/users/auth
+Content-Type: application/json
+
+{
+  "public_key": "<standard base64 of the SubjectPublicKeyInfo DER of a P-256 key>",
+  "challenge": "<the challenge exactly as issued>",
+  "signature": "<standard base64 of the raw 64-byte r‖s ECDSA signature>"
+}
+```
+
+The signature covers the SHA-256 digest of the newline-joined statement
+
+```
+openrung-user-auth-v1
+<challenge>
+<canonical public key>
+```
+
+where the canonical public key is the standard base64 of the 65-byte
+uncompressed point. Every SPKI encoding of one key therefore names one user.
+The body must be exactly one JSON object with no unknown fields (8 KiB cap).
+The challenge is consumed before the signature is checked: each challenge
+buys exactly one verification attempt.
+
+Success is `200 OK`:
+
+```json
+{
+  "user_id": "user_0123456789abcdef0123456789abcdef",
+  "status": "enabled",
+  "access_token": "<opaque bearer token>",
+  "token_expires_at": "2026-10-17T12:00:00Z"
+}
+```
+
+The access token is opaque to clients and authenticates later control-plane
+requests for 24 hours by default (`OPENRUNG_ACCESS_TOKEN_TTL`); it must be
+sent only as an `Authorization: Bearer` header over HTTPS and never logged.
+Rotating `OPENRUNG_USER_TOKEN_KEY` invalidates every outstanding token at
+once, and clients re-authenticate.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Malformed body, unknown field, unparseable or non-P-256 key, invalid challenge text |
+| `401` | `challenge unknown or expired`, or `invalid signature` |
+| `403` | The user is disabled; the body carries `user_id` and `status` but no token |
+| `429` | Enrollment budget exhausted for this source; `Retry-After` says when the window resets |
+| `503` | Store unavailable |
+
+**Enrollment budget.** Only a *new* identity is charged, after its signature
+verifies, against two fixed windows per source (the IPv4 address, or the IPv6
+/64): `OPENRUNG_ENROLLMENT_BURST_LIMIT` per hour (default 3) and
+`OPENRUNG_ENROLLMENT_DAILY_LIMIT` per 24 hours (default 10). A refused
+attempt is never charged, and existing keys authenticate freely. A negative
+limit disables that window. Clients behind one shared address share a budget,
+so a client should surface the `Retry-After` rather than retry immediately.
+
+Later authentication of an existing key only updates its `last_auth_at`;
+nothing else about the record changes, and a disabled identity stays disabled.
+
+### Operational user endpoints
+
+```http
+GET /admin/api/users/{id}
+PUT /admin/api/users/{id}/status
+Authorization: Bearer <OPENRUNG_API_TOKEN>
+```
+
+`GET` returns the operator view — never the public key:
+
+```json
+{
+  "user_id": "user_0123456789abcdef0123456789abcdef",
+  "status": "disabled",
+  "created_at": "2026-10-16T12:00:00Z",
+  "last_auth_at": "2026-10-16T14:00:00Z",
+  "disabled_at": "2026-10-16T15:00:00Z",
+  "disabled_reason": "abuse report"
+}
+```
+
+`PUT` takes exactly one JSON object `{"status": "disabled", "reason": "…"}`
+(or `"enabled"`, which clears the reason) and answers with the updated view.
+Disabling also revokes every live [access lease](#relay-lease-sync) the user
+holds; enabling revokes nothing.
+The reason is at most 256 characters of printable text. Every change is
+logged with the caller's IP. Unknown or malformed IDs are `404`; the routes
+share the operational API's limiter and exist only when both
+`OPENRUNG_API_TOKEN` and `OPENRUNG_USER_TOKEN_KEY` are configured.
 
 ## Issue WSS Session Ticket
 

@@ -186,6 +186,15 @@ type Config struct {
 	// every derived credential at once without touching the relay identity —
 	// the response to a suspected derivation-key leak.
 	CredentialEpoch string
+	// DisableAccessLeases keeps a direct-mode relay off the broker's per-client
+	// credential (access lease) channel. By default a rotating direct-mode
+	// relay declares the capability at registration and, when the broker
+	// echoes it, long-polls the broker for the set of broker-issued per-client
+	// credentials to accept, installs them through the same Xray management
+	// API rotation uses, and acknowledges each applied revision. Leases need
+	// rotation's managed xray, so a static session (rotation off, or an xray
+	// this relay does not run) never declares them. Tunnel mode is untouched.
+	DisableAccessLeases bool
 	// ConfigDir is where the generated xray config (which contains the Reality
 	// private key) is written, 0600. Defaults to os.TempDir().
 	ConfigDir string
@@ -1321,6 +1330,9 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 		NodeClass:        cfg.NodeClass,
 		Transport:        relay.TransportDirect,
 		WSSFronts:        slices.Clone(cfg.WSSFronts),
+		// Per-client credentials ride the managed xray rotation already
+		// drives; a static session has nothing to install them with.
+		AccessLeases: credentials != nil && !cfg.DisableAccessLeases,
 	}
 	// Every register call — initial and after an expired lease — signs a fresh
 	// proof over the final request fields, so the proof never ages out within
@@ -1358,15 +1370,78 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 		credentials.confirm(time.Now(), desc.ClientID)
 	}
 	e.registrations.Add(1)
-	e.setStatus(func() {
-		e.phase = PhaseOnline
-		e.transport = relay.TransportDirect
-		e.relayID = desc.ID
-		e.publicHost = desc.PublicHost
-		e.publicPort = desc.PublicPort
-		e.lastErr = ""
-		e.onlineAt = time.Now()
-	})
+	// goOnline publishes the registration-time endpoint. It takes a copy of
+	// the descriptor because the lease syncer may call it from its own
+	// goroutine while the heartbeat below is already re-registering.
+	registered := desc
+	goOnline := func() {
+		e.setStatus(func() {
+			e.phase = PhaseOnline
+			e.transport = relay.TransportDirect
+			e.relayID = registered.ID
+			e.publicHost = registered.PublicHost
+			e.publicPort = registered.PublicPort
+			e.lastErr = ""
+			e.onlineAt = time.Now()
+		})
+	}
+	// A lease-capable session is online once the broker has confirmed the
+	// relay applied its first lease set (possibly empty): before that ack the
+	// broker would not hand any client a credential for this relay. The
+	// syncer is its own goroutine — its poll blocks for the broker's hold —
+	// and shares the session's (ID, token) through leaseSess, which the
+	// heartbeat refreshes on re-registration. A broker that did not echo the
+	// capability (it predates leases) leaves the session exactly as before.
+	// The decision is re-evaluated after every registration: a broker
+	// upgraded mid-session starts echoing the capability on the next
+	// re-registration and the syncer starts then; one that stops echoing it
+	// ends the syncer, which removes the leases it installed.
+	// One lease worker lives for the whole session (started lazily on the
+	// first registration that confirms the capability) and is switched
+	// between synchronising and draining, so a withdrawn capability keeps
+	// retrying removals and expiring leases until nothing is installed
+	// rather than abandoning credentials with their expiry worker gone.
+	var onlineOnce sync.Once
+	leaseSess := &leaseSession{}
+	var syncer *leaseSync
+	var stopLeases func()
+	defer func() {
+		if stopLeases != nil {
+			stopLeases()
+		}
+	}()
+	ensureLeaseSync := func(registered relay.Descriptor) {
+		leaseSess.set(registered.ID, registered.LeaseToken)
+		capable := credentials != nil && registered.LeaseCapable
+		if capable && syncer == nil {
+			syncer = newLeaseSync(broker, leaseSess, credentials.users, cfg.HeartbeatInterval, e.logf)
+			syncer.onApplied = func() { onlineOnce.Do(goOnline) }
+			leaseCtx, cancelLeases := context.WithCancel(ctx)
+			leaseDone := make(chan struct{})
+			go func() {
+				defer close(leaseDone)
+				syncer.run(leaseCtx)
+			}()
+			stopLeases = func() { cancelLeases(); <-leaseDone }
+		}
+		if syncer != nil {
+			if capable != syncer.isActive() {
+				if capable {
+					e.logf("access leases are on: installing broker-issued per-client credentials")
+				} else {
+					e.logf("the broker no longer confirms access leases; removing installed per-client credentials")
+				}
+			}
+			syncer.setActive(capable)
+		}
+		if !capable {
+			if req.AccessLeases {
+				e.logf("the broker did not confirm access leases; serving the shared credential only")
+			}
+			onlineOnce.Do(goOnline)
+		}
+	}
+	ensureLeaseSync(desc)
 
 	heartbeat := time.NewTicker(cfg.HeartbeatInterval)
 	defer heartbeat.Stop()
@@ -1441,6 +1516,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 			return
 		}
 		desc = updated
+		ensureLeaseSync(desc)
 		e.logf("re-registered with the broker as %q (%s)", desc.Label, desc.ID)
 		if credentials != nil {
 			credentials.confirm(now, desc.ClientID)

@@ -22,13 +22,20 @@ const (
 	DefaultHandshakeRatePerSecond       = 20.0
 	DefaultHandshakeBurst               = 200
 	DefaultMaxTrackedSources            = 100_000
+	// A session's stream budget starts at the ticket's max_streams and refills
+	// at this rate, so a long-lived session keeps working while one ticket's
+	// rate of loopback Reality dials stays bounded.
+	DefaultStreamRefillPerSecond = 10.0
 	// Defaults are intentionally generous for carrier-grade NAT. Operators can
 	// tune them, while global caps remain the primary overload boundary.
 	DefaultMaxSessionsPerSource = 512
 	DefaultMaxStreamsPerSource  = 4096
 	DefaultNoStreamIdleTimeout  = wsscore.DefaultNoStreamIdleTimeout
 
-	maxTrackedSources   = 1_000_000
+	maxTrackedSources = 1_000_000
+	// yamuxAcceptBacklog is wsscore's yamux AcceptBacklog: the most streams a
+	// peer can have opened that the sidecar has not yet accepted.
+	yamuxAcceptBacklog  = 256
 	maxTokenRefillDelay = 100 * 365 * 24 * time.Hour
 )
 

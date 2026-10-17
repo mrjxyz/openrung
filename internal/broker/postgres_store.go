@@ -45,7 +45,8 @@ const descriptorColumns = `
 	node_class,
 	identity_public_key,
 	lease_token,
-	wss_fronts
+	wss_fronts,
+	lease_capable
 `
 
 const postgresOperationTimeout = 5 * time.Second
@@ -178,6 +179,58 @@ CREATE TABLE IF NOT EXISTS relay_ranking_weights (
 	weight double precision NOT NULL CHECK (weight >= 0 AND weight <= 1),
 	updated_at timestamptz NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+	id text PRIMARY KEY,
+	public_key text NOT NULL UNIQUE,
+	status text NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled')),
+	created_at timestamptz NOT NULL,
+	last_auth_at timestamptz NOT NULL,
+	disabled_at timestamptz,
+	disabled_reason text NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS user_enrollment_counters (
+	source_key text NOT NULL,
+	window_name text NOT NULL,
+	window_start timestamptz NOT NULL,
+	window_seconds bigint NOT NULL CHECK (window_seconds > 0),
+	count integer NOT NULL,
+	PRIMARY KEY (source_key, window_name)
+);
+
+ALTER TABLE relay_descriptors
+	ADD COLUMN IF NOT EXISTS lease_capable boolean NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS access_leases (
+	id text PRIMARY KEY,
+	user_id text NOT NULL REFERENCES users (id),
+	relay_id text NOT NULL,
+	credential text NOT NULL,
+	created_at timestamptz NOT NULL,
+	renewed_at timestamptz NOT NULL,
+	expires_at timestamptz NOT NULL,
+	revoked_at timestamptz,
+	revision bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS access_leases_relay_revision_idx
+	ON access_leases (relay_id, revision);
+
+CREATE INDEX IF NOT EXISTS access_leases_live_by_user_idx
+	ON access_leases (user_id, expires_at)
+	WHERE revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS access_leases_live_by_relay_idx
+	ON access_leases (relay_id, expires_at)
+	WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS relay_lease_state (
+	relay_id text PRIMARY KEY,
+	revision bigint NOT NULL DEFAULT 0,
+	applied_revision bigint NOT NULL DEFAULT 0,
+	updated_at timestamptz NOT NULL
+);
 `
 
 type PostgresStore struct {
@@ -237,6 +290,7 @@ func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl t
 		ID:                id,
 		IdentityPublicKey: req.IdentityPublicKey,
 		LeaseToken:        leaseToken,
+		LeaseCapable:      req.AccessLeases && identityKey != nil,
 		Label:             req.Label,
 		NodeClass:         normalizeNodeClass(req.NodeClass),
 		PublicHost:        req.PublicHost,
@@ -339,9 +393,10 @@ func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl t
 			node_class,
 			identity_public_key,
 			lease_token,
-			wss_fronts
+			wss_fronts,
+			lease_capable
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $28
 		)
 		ON CONFLICT (public_host, public_port) DO UPDATE SET
 			id = EXCLUDED.id,
@@ -372,7 +427,8 @@ func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl t
 			node_class = EXCLUDED.node_class,
 			identity_public_key = EXCLUDED.identity_public_key,
 			lease_token = EXCLUDED.lease_token,
-			wss_fronts = EXCLUDED.wss_fronts
+			wss_fronts = EXCLUDED.wss_fronts,
+			lease_capable = EXCLUDED.lease_capable
 		WHERE relay_descriptors.node_class <> $27
 			OR EXCLUDED.node_class = $27
 			OR relay_descriptors.expires_at <= EXCLUDED.registered_at
@@ -404,6 +460,7 @@ func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl t
 		desc.LeaseToken,
 		wssFrontsJSON,
 		relay.NodeClassFoundation,
+		desc.LeaseCapable,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The upsert matched an existing row but the WHERE suppressed the
@@ -415,6 +472,18 @@ func (s *PostgresStore) Register(req relay.RegisterRequest, now time.Time, ttl t
 		return relay.Descriptor{}, err
 	}
 	if tx, ok := querier.(pgx.Tx); ok {
+		// A new lease token means a new relay session that has applied no
+		// lease set yet: reset applied_revision (keeping revision) so the
+		// relay's first poll re-installs every live lease before any is relied
+		// upon. The row is keyed by the stable ID and is never deleted with a
+		// descriptor — neither by the endpoint-move DELETE above nor by Prune.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO relay_lease_state (relay_id, revision, applied_revision, updated_at)
+			VALUES ($1, 0, 0, $2)
+			ON CONFLICT (relay_id) DO UPDATE SET applied_revision = 0, updated_at = EXCLUDED.updated_at`,
+			desc.ID, now); err != nil {
+			return relay.Descriptor{}, fmt.Errorf("reset relay lease state: %w", err)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return relay.Descriptor{}, fmt.Errorf("commit relay registration: %w", err)
 		}
@@ -622,6 +691,12 @@ func (s *PostgresStore) Prune(now time.Time) ([]relay.Descriptor, error) {
 		return nil, err
 	}
 	if _, err := s.pool.Exec(ctx, `DELETE FROM relay_sessions WHERE terminal_at IS NOT NULL AND terminal_at < $1`, cutoff); err != nil {
+		return nil, err
+	}
+	if err := s.pruneEnrollmentCounters(ctx, now); err != nil {
+		return nil, err
+	}
+	if err := s.pruneLeases(ctx, now); err != nil {
 		return nil, err
 	}
 	return expired, nil
@@ -1005,6 +1080,7 @@ func scanDescriptor(row pgx.Row) (relay.Descriptor, error) {
 		&desc.IdentityPublicKey,
 		&desc.LeaseToken,
 		&wssFrontsJSON,
+		&desc.LeaseCapable,
 	)
 	if err != nil {
 		return relay.Descriptor{}, err

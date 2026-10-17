@@ -49,7 +49,38 @@ func run() error {
 		fmt.Println(versionInfo())
 		return nil
 	}
-	wssTicketSeed, err := parseOptionalWSSTicketSeed(os.Getenv("OPENRUNG_WSS_TICKET_SIGNING_SEED"))
+	wssTicketSeed, err := parseOptionalSeed("OPENRUNG_WSS_TICKET_SIGNING_SEED", os.Getenv("OPENRUNG_WSS_TICKET_SIGNING_SEED"), ed25519.SeedSize)
+	if err != nil {
+		return err
+	}
+	// The user token key enables client enrollment/authentication; unset
+	// leaves those routes unregistered.
+	userTokenKey, err := parseOptionalSeed("OPENRUNG_USER_TOKEN_KEY", os.Getenv("OPENRUNG_USER_TOKEN_KEY"), 32)
+	if err != nil {
+		return err
+	}
+	accessTokenTTL, err := parseOptionalDuration("OPENRUNG_ACCESS_TOKEN_TTL")
+	if err != nil {
+		return err
+	}
+	enrollmentBurstLimit, err := parseOptionalInt("OPENRUNG_ENROLLMENT_BURST_LIMIT")
+	if err != nil {
+		return err
+	}
+	enrollmentDailyLimit, err := parseOptionalInt("OPENRUNG_ENROLLMENT_DAILY_LIMIT")
+	if err != nil {
+		return err
+	}
+	// Per-client relay credentials (access leases): lifetime and live caps.
+	accessLeaseTTL, err := parseOptionalDuration("OPENRUNG_ACCESS_LEASE_TTL")
+	if err != nil {
+		return err
+	}
+	maxLeasesPerUser, err := parseOptionalInt("OPENRUNG_MAX_LEASES_PER_USER")
+	if err != nil {
+		return err
+	}
+	maxLeasesPerRelay, err := parseOptionalInt("OPENRUNG_MAX_LEASES_PER_RELAY")
 	if err != nil {
 		return err
 	}
@@ -103,6 +134,7 @@ func run() error {
 		{name: "OPENRUNG_DASHBOARD_TOKEN", value: dashboardToken},
 		canonicalSeedCredential("OPENRUNG_RELAY_SIGNING_KEY", signingSeed),
 		canonicalSeedCredential("OPENRUNG_WSS_TICKET_SIGNING_SEED", wssTicketSeed),
+		canonicalSeedCredential("OPENRUNG_USER_TOKEN_KEY", userTokenKey),
 	}); err != nil {
 		return err
 	}
@@ -140,6 +172,15 @@ func run() error {
 		GeoIP:                      geoResolver,
 		SigningSeed:                signingSeed,
 		WSSTicketSigningSeed:       wssTicketSeed,
+		UserTokenKey:               userTokenKey,
+		AccessTokenTTL:             accessTokenTTL,
+		EnrollmentBudget:           broker.EnrollmentBudget{BurstLimit: enrollmentBurstLimit, DailyLimit: enrollmentDailyLimit},
+		AccessLeaseTTL:             accessLeaseTTL,
+		MaxLeasesPerUser:           maxLeasesPerUser,
+		MaxLeasesPerRelay:          maxLeasesPerRelay,
+	}
+	if len(userTokenKey) > 0 {
+		slog.Info("client user authentication enabled")
 	}
 	// The Postgres store aggregates dashboard queries in SQL; the JSONL sink's
 	// dashboard is aggregated in Go from its in-memory record set.
@@ -337,19 +378,50 @@ func splitAndTrim(value string) []string {
 	return out
 }
 
-func parseOptionalWSSTicketSeed(value string) ([]byte, error) {
+// parseOptionalSeed decodes an optional standard-base64 secret of exactly
+// size bytes; empty means unset.
+func parseOptionalSeed(name, value string, size int) ([]byte, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, nil
 	}
 	seed, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
-		return nil, errors.New("OPENRUNG_WSS_TICKET_SIGNING_SEED must be standard base64")
+		return nil, fmt.Errorf("%s must be standard base64", name)
 	}
-	if len(seed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("OPENRUNG_WSS_TICKET_SIGNING_SEED must decode to %d bytes", ed25519.SeedSize)
+	if len(seed) != size {
+		return nil, fmt.Errorf("%s must decode to %d bytes", name, size)
 	}
 	return append([]byte(nil), seed...), nil
+}
+
+// parseOptionalDuration reads an optional Go duration from the environment;
+// empty means zero (the component's default).
+func parseOptionalDuration(name string) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration like 24h: %w", name, err)
+	}
+	return parsed, nil
+}
+
+// parseOptionalInt reads an optional integer from the environment; empty
+// means zero (the component's default). Negative values are passed through,
+// since some limits use them to mean "disabled".
+func parseOptionalInt(name string) (int, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", name)
+	}
+	return parsed, nil
 }
 
 // pruneTelemetryPartitions drops aged-out telemetry partitions when the sink
