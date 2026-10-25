@@ -54,9 +54,17 @@ func (s *Engine) supervise(ctx context.Context, conn *connection, cur *candidate
 			go s.healthLoopWithProbe(cur.ctx, port, s.livenessFronts(conn), healthFail, healthKick, probe, nil)
 		}
 
+		// A lease from per-user access is renewed while this candidate lives;
+		// the renewer reports only expiry, replacement or a disable.
+		leaseFail := make(chan error, 1)
+		if conn.lease.valid() {
+			go s.renewLease(cur.ctx, cur.relay, conn.lease, leaseFail)
+		}
+
 		var trigger error
 		var triggerReason string
 		transportFailure := false
+		accessLost := false
 		triggerWasHealth := false
 		var recovery *networkRecoveryBudget
 	watchTrigger:
@@ -128,6 +136,23 @@ func (s *Engine) supervise(ctx context.Context, conn *connection, cur *candidate
 				triggerReason = fmt.Sprintf("tunnel health check failed %d times", HealthFailureThreshold)
 				s.appendLog(fmt.Sprintf("tunnel health check failed %d times; reconnecting", HealthFailureThreshold))
 				break watchTrigger
+			case leaseErr := <-leaseFail:
+				if ctx.Err() != nil || s.isDisconnecting(conn) {
+					return "", nil
+				}
+				if errors.Is(leaseErr, ErrAccessDisabled) {
+					return "access_denied", leaseErr
+				}
+				// Neither the relay nor the path failed: the credential is (about
+				// to be) refused, so fetch a new one through recovery.
+				trigger = leaseErr
+				accessLost = true
+				triggerReason = "relay access expired"
+				if errors.Is(leaseErr, errLeaseRelayGone) {
+					triggerReason = "relay no longer listed"
+				}
+				s.appendLog("relay access could not be renewed; reconnecting")
+				break watchTrigger
 			case <-conn.netNotify:
 				if ctx.Err() != nil || s.isDisconnecting(conn) {
 					return "", nil
@@ -169,7 +194,10 @@ func (s *Engine) supervise(ctx context.Context, conn *connection, cur *candidate
 
 		oldRelayID := cur.relay.ID
 		failedRelayID := oldRelayID
-		if transportFailure {
+		if accessLost {
+			// Not evidence against the relay: no ranking dent, no demotion.
+			failedRelayID = ""
+		} else if transportFailure {
 			// A front/session failure is not evidence against the destination relay.
 			failedRelayID = ""
 			if gracefulWSSSessionEnd(trigger) {
@@ -262,6 +290,9 @@ func (s *Engine) supervise(ctx context.Context, conn *connection, cur *candidate
 			if ctx.Err() != nil {
 				return "", nil
 			}
+			if errors.Is(err, ErrAccessDisabled) {
+				return "access_denied", err
+			}
 			if _, local := localCandidateErrorStage(err); s.Mobile != nil && local {
 				return "failover_exhausted", err
 			}
@@ -345,6 +376,7 @@ func (s *Engine) reladder(ctx context.Context, conn *connection, port int, targe
 	if err != nil {
 		return nil, 0, stage, err
 	}
+	cands = s.adaptToAddressFamily(conn, cands)
 	// Rank first, then demote: the relay that just died is demoted for having
 	// lost its tunnel, not for being slow, so ranking must not lift it back to
 	// the front. Demoting last keeps both invariants — the ladder is in client
@@ -367,6 +399,11 @@ func (s *Engine) reladder(ctx context.Context, conn *connection, port int, targe
 		}
 	}
 	res, err := s.runLadder(ctx, conn, cands, port)
+	if err != nil {
+		if fallback, fallbackOrder, ok, fallbackErr := s.runPublicFallback(ctx, conn, brokerURL, target, cands, port, failedRelayID, err); ok {
+			res, order, err = fallback, fallbackOrder, fallbackErr
+		}
+	}
 	if err != nil {
 		return nil, 0, "relay_connect", err
 	}

@@ -21,6 +21,12 @@ import (
 // small structs, so anything near the cap is malformed or hostile.
 const maxRegisterBodyBytes = 64 << 10
 
+// Relay-list page sizes applied when Config leaves them zero.
+const (
+	DefaultRelayListLimit    = 5
+	DefaultRelayListMaxLimit = 20
+)
+
 type Config struct {
 	RegistrationToken string
 	// FoundationToken is the privileged bearer token that authorizes
@@ -41,6 +47,11 @@ type Config struct {
 	TelemetryReader  TelemetryReader
 	TelemetryQuerier TelemetryQuerier
 	DashboardToken   string
+	// Version and Revision identify the running broker build in the admin
+	// dashboard's footer; cmd/broker passes buildinfo's values. Empty renders
+	// "dev" with no revision.
+	Version  string
+	Revision string
 	// APIToken is the bearer credential for the machine-to-machine operational
 	// API (GET /admin/api/relays/inventory). It is deliberately separate from
 	// DashboardToken — that one buys an interactive browser session over the
@@ -70,6 +81,14 @@ type Config struct {
 	// can show where relays are located. Nil disables lookups;
 	// descriptors then carry empty geo fields.
 	GeoIP GeoIPResolver
+	// RelayProber checks that a direct-transport relay's advertised endpoint
+	// accepts inbound connections, at registration and again on heartbeat
+	// every RelayProbeInterval (zero applies defaultRelayProbeInterval). A
+	// relay whose latest probe failed stays registered but is withheld from
+	// the public directory and access answers until a probe succeeds. Nil
+	// disables probing: every relay is listed on its lease alone.
+	RelayProber        RelayProber
+	RelayProbeInterval time.Duration
 	// SigningSeed is the 32-byte Ed25519 seed that signs every relay-list
 	// response body. Required: cmd/broker validates OPENRUNG_RELAY_SIGNING_KEY
 	// with ParseSigningSeed and refuses to start without it, because serving
@@ -79,8 +98,20 @@ type Config struct {
 	// tickets. Keeping it separate from relay-list signing permits independent
 	// rotation; sidecars accept the new and old public keys during overlap.
 	WSSTicketSigningSeed []byte
-	WSSTicketTTL         time.Duration
-	WSSTicketMaxStreams  int
+	// WSSTicketTTL and WSSTicketMaxStreams bound each issued ticket
+	// (OPENRUNG_WSS_TICKET_TTL, OPENRUNG_WSS_TICKET_MAX_STREAMS); zero applies
+	// the defaults.
+	WSSTicketTTL        time.Duration
+	WSSTicketMaxStreams int
+	// RateLimits overrides the per-client budgets of the public endpoints
+	// (OPENRUNG_RATE_LIMIT_*); zero fields apply the defaults.
+	RateLimits RateLimits
+	// RelayListDefaultLimit is the relay-list page size when a request names
+	// none, and RelayListMaxLimit the largest a request may ask for
+	// (OPENRUNG_RELAY_LIST_DEFAULT_LIMIT, OPENRUNG_RELAY_LIST_MAX_LIMIT). Zero
+	// applies the defaults; a request above the maximum is refused with 400.
+	RelayListDefaultLimit int
+	RelayListMaxLimit     int
 	// UserTokenKey is the 32-byte HMAC key behind client access tokens
 	// (OPENRUNG_USER_TOKEN_KEY). It enables the user challenge/auth endpoints
 	// and the operational user routes; empty leaves all of them unregistered,
@@ -94,6 +125,10 @@ type Config struct {
 	// EnrollmentBudget limits NEW user identities per source address (IPv6:
 	// per /64). Zero fields apply the defaults; see EnrollmentBudget.
 	EnrollmentBudget EnrollmentBudget
+	// SourceClassifier refuses NEW user identities from datacenter networks
+	// (source_class.go); nil disables the check. The caller keeps it fresh
+	// (SourceClassifier.Run).
+	SourceClassifier *SourceClassifier
 	// AccessLeaseTTL is how long an issued per-client relay credential stays
 	// valid without renewal (OPENRUNG_ACCESS_LEASE_TTL); zero applies the
 	// default (1 h). Renewal extends the same credential.
@@ -112,15 +147,25 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 	if cfg.RelayLeaseTTL == 0 {
 		cfg.RelayLeaseTTL = 3 * time.Minute
 	}
+	if cfg.RelayProbeInterval == 0 {
+		cfg.RelayProbeInterval = defaultRelayProbeInterval
+	}
+	if cfg.RelayListMaxLimit == 0 {
+		cfg.RelayListMaxLimit = max(DefaultRelayListMaxLimit, cfg.RelayListDefaultLimit)
+	}
+	if cfg.RelayListDefaultLimit == 0 {
+		cfg.RelayListDefaultLimit = min(DefaultRelayListLimit, cfg.RelayListMaxLimit)
+	}
 	relaySigner := newSigner(cfg.SigningSeed)
 	wssIssuer := newWSSTicketIssuer(cfg)
 	clientIP := newClientIPResolver(cfg.TrustedProxyCIDRs)
 	clientSeen := newClientSeenDeduper(clientSeenDedupWindow, clientSeenDedupMaxEntries)
-	relayListLimiter := newIPRateLimiter(relayListRatePerSecond, relayListBurst, rateLimiterMaxTrackedIPs)
-	telemetryLimiter := newIPRateLimiter(telemetryRatePerSecond, telemetryBurst, rateLimiterMaxTrackedIPs)
-	speedTestLimiter := newIPRateLimiter(speedTestRatePerSecond, speedTestBurst, rateLimiterMaxTrackedIPs)
-	relayRegistrationLimiter := newIPRateLimiter(relayRegistrationRatePerSecond, relayRegistrationBurst, rateLimiterMaxTrackedIPs)
-	wssTicketLimiter := newIPRateLimiter(wssTicketRatePerSecond, wssTicketBurst, rateLimiterMaxTrackedIPs)
+	rateLimits := cfg.RateLimits.withDefaults()
+	relayListLimiter := rateLimits.RelayList.limiter()
+	telemetryLimiter := rateLimits.Telemetry.limiter()
+	speedTestLimiter := rateLimits.SpeedTest.limiter()
+	relayRegistrationLimiter := rateLimits.RelayRegistration.limiter()
+	wssTicketLimiter := rateLimits.WSSTicket.limiter()
 	relayLedger := newRelayIDLedger(relayLedgerTTL, relayLedgerMaxEntries)
 	seedRelayLedger(relayLedger, store)
 	newIDCap := newNewRelayCap(cfg.MaxNewRelayIDsPerIPPerDay, newRelayCapWindow, cfg.RegistrationCapExemptCIDRs)
@@ -140,6 +185,9 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		if wssIssuer != nil {
 			response["wss_ticket_key_id"] = wssIssuer.signer.KeyID()
 		}
+		if cfg.SourceClassifier != nil {
+			response["source_classification_available"] = cfg.SourceClassifier.Available(time.Now())
+		}
 		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("POST /api/v1/relays/register", registerRelay)
@@ -154,7 +202,7 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		mux.HandleFunc("GET /api/v1/relays/{id}/leases", rateLimited(relayRegistrationLimiter, clientIP, 10, access.leasePollHandler()))
 		mux.HandleFunc("POST /api/v1/relays/{id}/leases/ack", rateLimited(relayRegistrationLimiter, clientIP, 10, access.leaseAckHandler()))
 	}
-	mux.HandleFunc("GET /api/v1/relays", rateLimited(relayListLimiter, clientIP, 10, listRelaysHandler(store, cfg.TelemetrySink, clientIP, clientSeen, relaySigner)))
+	mux.HandleFunc("GET /api/v1/relays", rateLimited(relayListLimiter, clientIP, 10, listRelaysHandler(store, cfg.TelemetrySink, clientIP, clientSeen, relaySigner, cfg.RelayProber != nil, cfg.RelayListDefaultLimit, cfg.RelayListMaxLimit)))
 	if wssIssuer != nil {
 		mux.HandleFunc("POST /api/v1/wss/tickets", rateLimitedBy(wssTicketLimiter, wssTicketRateKey(clientIP), 10, wssTicketHandler(store, wssIssuer)))
 	}
@@ -177,6 +225,9 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		mux.HandleFunc("/admin/api/relays/weights", operational(relayWeightsListHandler(store, cfg.APIToken)))
 		mux.HandleFunc("/admin/api/relays/{id}/weight", operational(relayWeightHandler(store, cfg.APIToken, clientIP.clientIP)))
 		if users != nil {
+			if directory, ok := store.(userDirectory); ok {
+				mux.HandleFunc("/admin/api/users", operational(adminUserListHandler(directory, cfg.APIToken)))
+			}
 			mux.HandleFunc("/admin/api/users/{id}", operational(adminUserHandler(users.store, cfg.APIToken)))
 			mux.HandleFunc("/admin/api/users/{id}/status", operational(adminUserStatusHandler(access.setUserStatus, cfg.APIToken, clientIP.clientIP)))
 		}
@@ -184,11 +235,19 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 			mux.HandleFunc("/admin/api/leases/{id}", operational(access.adminLeaseHandler(cfg.APIToken)))
 		}
 	}
+	// Client access issues per-user relay credentials; it needs both the
+	// token key (users) and a store that can hold leases (access).
+	if clientAccess := newClientAccessHandler(store, users, access, relaySigner); clientAccess != nil {
+		clientAccess.withholdUnreachable = cfg.RelayProber != nil
+		clientAccess.clientIP = clientIP.clientIP
+		accessLimiter := rateLimits.Access.limiter()
+		mux.HandleFunc("POST /api/v1/access", clientAccess.counted(rateLimitedBy(accessLimiter, clientAccess.rateKey(clientIP), 10, clientAccess.handler())))
+	}
 	// Client user endpoints exist only with an access token key configured.
 	// One limiter spans both: a challenge is worthless without the auth call
 	// that consumes it, so budgeting them together bounds the pair.
 	if users != nil {
-		userAuthLimiter := newIPRateLimiter(userAuthRatePerSecond, userAuthBurst, rateLimiterMaxTrackedIPs)
+		userAuthLimiter := rateLimits.UserAuth.limiter()
 		mux.HandleFunc("POST /api/v1/users/challenge", rateLimited(userAuthLimiter, clientIP, 10, users.challengeHandler()))
 		mux.HandleFunc("POST /api/v1/users/auth", rateLimited(userAuthLimiter, clientIP, 10, users.authHandler()))
 	}
@@ -200,10 +259,18 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 	}
 	if cfg.DashboardToken != "" && querier != nil {
 		dashboard := newDashboardServer(cfg.DashboardToken, querier)
+		dashboard.version, dashboard.revision = cfg.Version, cfg.Revision
 		dashboard.relayDisplays = relayDisplayResolver(store)
 		dashboard.relayDirectory = store
 		dashboard.relayWeights = store
 		dashboard.clientIP = clientIP.clientIP
+		// The users page follows the operational user routes: it exists
+		// with client users (an access token key) and shares their store
+		// and status implementation.
+		if directory, ok := store.(userDirectory); ok && users != nil {
+			dashboard.users = directory
+			dashboard.userStatus = access.setUserStatus
+		}
 		dashboard.register(mux)
 	}
 
@@ -234,6 +301,20 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 			return
 		}
 		req.Label = label
+
+		contact, err := relay.NormalizeOperatorContact(req.OperatorContact)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.OperatorContact = contact
+
+		accessHost, err := relay.NormalizeAccessHost(req.AccessHost)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.AccessHost = accessHost
 
 		nodeClass, err := relay.NormalizeNodeClass(req.NodeClass)
 		if err != nil {
@@ -294,6 +375,18 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 			}()
 		}
 
+		// The relay listens before it registers, so its endpoint is probed in
+		// the same request, before anything is stored: a port nothing outside
+		// the host can reach is rejected with the reason, and the relay's own
+		// retry loop re-registers (and is re-probed) until it opens. See
+		// reachability.go. An inconclusive probe registers the relay unprobed.
+		probed, probeErr := probeRegistration(r.Context(), cfg.RelayProber, req)
+		if probeErr != nil {
+			slog.Warn("relay registration rejected: endpoint unreachable", "node_class", maxClass, "public", req.PublicHost, "port", req.PublicPort, "version", req.RelayVersion, "error", probeErr)
+			writeError(w, http.StatusUnprocessableEntity, unreachableRegistrationMessage(req))
+			return
+		}
+
 		desc, err := store.Register(req, now, cfg.RelayLeaseTTL)
 		// A malformed or stale identity proof fails the registration loudly
 		// instead of silently falling back to a random relay ID — a relay that
@@ -325,7 +418,10 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 		// identity can never drain more than one unit of an address's budget.
 		keepReservation = ledger.rememberIfNew(desc.ID, desc.NodeClass, now)
 		resolveRelayGeo(r.Context(), store, cfg.GeoIP, &desc)
-		slog.Info("relay registered", "relay_id", desc.ID, "node_class", desc.NodeClass, "public", desc.PublicHost, "port", desc.PublicPort, "city", desc.City, "country", desc.Country, "max_sessions", desc.MaxSessions, "version", desc.RelayVersion)
+		if probed {
+			recordReachability(store, &desc, true, now)
+		}
+		slog.Info("relay registered", "relay_id", desc.ID, "node_class", desc.NodeClass, "public", desc.PublicHost, "port", desc.PublicPort, "city", desc.City, "country", desc.Country, "max_sessions", desc.MaxSessions, "version", desc.RelayVersion, "reachable", reachabilityLogValue(desc))
 
 		writeJSON(w, http.StatusCreated, relay.RegisterResponse{Descriptor: desc})
 	}
@@ -393,6 +489,10 @@ func heartbeatHandler(store RelayStore, cfg Config, ledger *relayIDLedger) http.
 		// Backfill relays whose registration-time lookup failed (or that
 		// registered before the broker resolved locations at all).
 		resolveRelayGeo(r.Context(), store, cfg.GeoIP, &desc)
+		// Re-probe the endpoint once the stored result is old enough, so a
+		// relay that went dark is withheld and a repaired one is relisted
+		// without waiting for a re-registration.
+		probeRelayReachability(r.Context(), store, cfg.RelayProber, cfg.RelayProbeInterval, &desc, now)
 
 		// Echo the credential now being served so a rotating relay can retire
 		// its predecessor only once the directory has moved on (a legacy
@@ -439,7 +539,10 @@ func geoLookupHost(desc *relay.Descriptor) string {
 	return desc.PublicHost
 }
 
-func listRelaysHandler(store RelayStore, telemetrySink TelemetrySink, clientIP *clientIPResolver, clientSeen *clientSeenDeduper, s signer) http.HandlerFunc {
+// withholdUnreachable is whether reachability probing is enabled, and so
+// whether a stored failed probe keeps a relay off the page.
+func listRelaysHandler(store RelayStore, telemetrySink TelemetrySink, clientIP *clientIPResolver, clientSeen *clientSeenDeduper, s signer, withholdUnreachable bool, defaultLimit, maxLimit int) http.HandlerFunc {
+	limitError := "limit must be between 1 and " + strconv.Itoa(maxLimit)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Relay availability is real-time: shared caches (Cloudflare's edge in
 		// production) must never store a copy, and clients cannot bust an edge
@@ -447,11 +550,11 @@ func listRelaysHandler(store RelayStore, telemetrySink TelemetrySink, clientIP *
 		// either; the signed success path upgrades it to no-store, no-transform.
 		w.Header().Set("Cache-Control", "no-store")
 		recordClientSeen(r, telemetrySink, clientIP, clientSeen)
-		limit := 5
+		limit := defaultLimit
 		if raw := r.URL.Query().Get("limit"); raw != "" {
 			parsed, err := strconv.Atoi(raw)
-			if err != nil || parsed < 1 || parsed > 20 {
-				writeError(w, http.StatusBadRequest, "limit must be between 1 and 20")
+			if err != nil || parsed < 1 || parsed > maxLimit {
+				writeError(w, http.StatusBadRequest, limitError)
 				return
 			}
 			limit = parsed
@@ -467,7 +570,7 @@ func listRelaysHandler(store RelayStore, telemetrySink TelemetrySink, clientIP *
 			writeError(w, http.StatusServiceUnavailable, "could not list relays")
 			return
 		}
-		relays = reserveWSSCandidate(relays, limit, weights)
+		relays = reserveWSSCandidate(withoutUnreachable(relays, withholdUnreachable), limit, weights)
 		s.writeSigned(w, relay.ListResponse{
 			Count:      len(relays),
 			ServerTime: now,
@@ -535,6 +638,10 @@ func validateRegisterRequest(req relay.RegisterRequest) error {
 		return errors.New("exit_host is only allowed for tunnel transport")
 	case req.ExitHost != "" && !validEndpointHost(req.ExitHost):
 		return errors.New("exit_host must be a DNS hostname or IP address")
+	case req.AccessHost != "" && normalizeTransport(req.Transport) != relay.TransportDirect:
+		return errors.New("access_host is only allowed for direct transport")
+	case req.AccessHost != "" && sameIPAddress(req.AccessHost, req.PublicHost):
+		return errors.New("access_host must differ from public_host")
 	case req.MaxSessions < 1:
 		return errors.New("max_sessions must be at least 1")
 	case req.MaxMbps < 1:
@@ -550,6 +657,14 @@ func validateRegisterRequest(req relay.RegisterRequest) error {
 	default:
 		return nil
 	}
+}
+
+// sameIPAddress reports whether two hosts are IP literals naming the same
+// address, however they are spelled.
+func sameIPAddress(a, b string) bool {
+	addrA, errA := netip.ParseAddr(a)
+	addrB, errB := netip.ParseAddr(b)
+	return errA == nil && errB == nil && addrA.Unmap() == addrB.Unmap()
 }
 
 // validEndpointHost accepts an IP literal or a syntactically valid DNS name.

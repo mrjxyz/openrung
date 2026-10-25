@@ -6,7 +6,7 @@
 #   deploy/relay/foundation-up.sh convert <host>...    # install credentials on an existing host
 #   deploy/relay/foundation-up.sh update  <host>...    # pull the image and recreate, reusing credentials
 #   deploy/relay/foundation-up.sh rollback <host>...   # restore an exact interrupted roll
-#   deploy/relay/foundation-up.sh audit   <host>...    # read-only: relay version + egress limit state
+#   deploy/relay/foundation-up.sh audit   <host>...    # read-only: relay version, egress limit, access address
 #
 # This wraps — and never replaces — lightsail-up.sh. That helper deliberately
 # refuses registration tokens because Lightsail retains user-data, so a Foundation
@@ -31,7 +31,15 @@
 # OPENRUNG_SSH_KEY, OPENRUNG_SSH_USER, OPENRUNG_REGION (host-key pinning lookups),
 # OPENRUNG_ALLOW_TOFU=1 (explicitly accept an unverifiable first-contact host key),
 # OPENRUNG_NEW_DEST_RATE (the host new-destination limit `convert` and `update`
-# load from the relay image: new destinations per second, default 10, or off).
+# load from the relay image: new destinations per second, default 10, or off),
+# OPENRUNG_FOUNDATION_CONTACT (the operator contact `convert` and `create` write
+# as OPENRUNG_OPERATOR_CONTACT, sent privately at registration; default empty,
+# which keeps whatever contact the host already has),
+# OPENRUNG_ACCESS_HOST (an IPv6 address, distinct from the relay's primary
+# address and its public host, that `convert` and `create` configure on the host
+# through the openrung-access-address unit and write into the env file, so the
+# relay advertises it privately at registration; `off` removes both; default
+# empty, which keeps whatever the host already has).
 # `create` also forwards OPENRUNG_BUNDLE and the rest of lightsail-up.sh's knobs.
 set -euo pipefail
 
@@ -58,6 +66,8 @@ SSH_KEY="${OPENRUNG_SSH_KEY:-$HOME/.ssh/id_ed25519_openrung}"
 SSH_USER="${OPENRUNG_SSH_USER:-ubuntu}"
 REGION="${OPENRUNG_REGION:-ap-northeast-1}"
 NEW_DEST_RATE="${OPENRUNG_NEW_DEST_RATE:-10}"
+FOUNDATION_CONTACT="${OPENRUNG_FOUNDATION_CONTACT:-}"
+ACCESS_HOST="${OPENRUNG_ACCESS_HOST:-}"
 
 CONTAINER="openrung-relay"
 OLD_CONTAINER="${CONTAINER}-old"
@@ -85,10 +95,16 @@ usage:
   deploy/relay/foundation-up.sh convert <host>...    # install credentials on an existing host
   deploy/relay/foundation-up.sh update  <host>...    # pull the image and recreate, reusing credentials
   deploy/relay/foundation-up.sh rollback <host>...   # restore an exact interrupted roll
-  deploy/relay/foundation-up.sh audit   <host>...    # read-only: relay version + egress limit state
+  deploy/relay/foundation-up.sh audit   <host>...    # read-only: relay version, egress limit, access address
 
 The Foundation token is read from OPENRUNG_FOUNDATION_TOKEN_CMD (preferred) or
 OPENRUNG_FOUNDATION_TOKEN — never from argv. `update` and `rollback` need no token.
+
+OPENRUNG_ACCESS_HOST=<IPv6 address> on `convert`/`create` adds that address to
+the host interface (deprecated, so the relay's own traffic keeps the primary
+address) through the openrung-access-address unit and has the relay advertise
+it privately at registration; OPENRUNG_ACCESS_HOST=off removes it. Unset keeps
+whatever the host has.
 
 Automation accepts one steady state only: a running `openrung-relay`, with no
 legacy container/env, `-old` backup, `-new` candidate, or staged `.tmp` file.
@@ -119,6 +135,9 @@ ssh_run() {
 
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'      # instance names, labels, container names
 HOST_RE='^[A-Za-z0-9][A-Za-z0-9.:-]*$'      # IPv4, IPv6, DNS names
+CONTACT_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9-][A-Za-z0-9.-]*\.[A-Za-z0-9-]+$'   # operator contact (email)
+ACCESS_HOST_RE='^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}$'   # IPv6 literal shape; the relay validates it fully
+DEV_RE='^[A-Za-z0-9._-]{1,15}$'             # network interface names
 
 assert_matches() { # value regex what
   local val="$1" re="$2" what="$3"
@@ -143,6 +162,13 @@ validate_config() {
   assert_matches "$ENV_FILE" '^/[A-Za-z0-9/._-]+$' "OPENRUNG_ENV_FILE"
   assert_matches "$IMAGE" '^[A-Za-z0-9][A-Za-z0-9:/@._-]*$' "OPENRUNG_IMAGE"
   assert_matches "$NEW_DEST_RATE" '^([1-9][0-9]*|off)$' "OPENRUNG_NEW_DEST_RATE"
+  if [ -n "$FOUNDATION_CONTACT" ]; then
+    assert_matches "$FOUNDATION_CONTACT" "$CONTACT_RE" "OPENRUNG_FOUNDATION_CONTACT"
+    [ "${#FOUNDATION_CONTACT}" -le 128 ] || die "OPENRUNG_FOUNDATION_CONTACT must be at most 128 characters"
+  fi
+  if [ -n "$ACCESS_HOST" ] && [ "$ACCESS_HOST" != off ]; then
+    assert_matches "$ACCESS_HOST" "$ACCESS_HOST_RE" "OPENRUNG_ACCESS_HOST (want a bare IPv6 address, or off)"
+  fi
   [ "$ENV_FILE" != "$LEGACY_ENV_FILE" ] \
     || die "OPENRUNG_ENV_FILE may not use the legacy path ${LEGACY_ENV_FILE}; migrate it to a canonical path first"
 }
@@ -429,7 +455,16 @@ require_env_has_token() {
 #   XRAY_PATH / CONFIG_OUT — image/entrypoint internals that docker inspect
 #     reports from the image's own ENV; pinning them in the host env file would
 #     permanently override future images that relocate those paths.
-PRESERVE_DROP='/^OPENRUNG_(BROKER_URL|FOUNDATION_TOKEN|VOLUNTEER_TOKEN|NODE_CLASS|XRAY_PATH|CONFIG_OUT)=/d'
+# OPERATOR_CONTACT is managed only when OPENRUNG_FOUNDATION_CONTACT is set, and
+# ACCESS_HOST only when OPENRUNG_ACCESS_HOST is; otherwise the host's existing
+# values are preserved like any other setting.
+PRESERVE_DROP_KEYS='BROKER_URL|FOUNDATION_TOKEN|VOLUNTEER_TOKEN|NODE_CLASS|XRAY_PATH|CONFIG_OUT'
+preserve_drop() {
+  local keys="$PRESERVE_DROP_KEYS"
+  [ -z "$FOUNDATION_CONTACT" ] || keys+='|OPERATOR_CONTACT'
+  [ -z "$ACCESS_HOST" ] || keys+='|ACCESS_HOST'
+  printf '/^OPENRUNG_(%s)=/d' "$keys"
+}
 
 # Stage the preserved settings into ENV_FILE.tmp on the host. The only accepted
 # sources are the canonical env file, when present, or the canonical running
@@ -447,7 +482,7 @@ stage_preserved_env() { # host container
     && { test -d ${ENV_FILE%/*} || install -d -m 700 -o root -g root ${ENV_FILE%/*}; } \
     && { if test -f ${ENV_FILE}; then cat ${ENV_FILE}; \
          else docker inspect ${container} --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true; fi; } \
-       | sed -n '/^OPENRUNG_[A-Za-z0-9_]*=/p' | sed -E '${PRESERVE_DROP}' > ${ENV_FILE}.tmp \
+       | sed -n '/^OPENRUNG_[A-Za-z0-9_]*=/p' | sed -E '$(preserve_drop)' > ${ENV_FILE}.tmp \
     && grep -q '^OPENRUNG_PUBLIC_HOST=..*' ${ENV_FILE}.tmp \
     || { rm -f ${ENV_FILE}.tmp; exit 1; }\"" \
     || die "${host}: could not stage the relay's existing settings (is OPENRUNG_PUBLIC_HOST set in its env file or container?)"
@@ -464,6 +499,8 @@ install_env_file() { # host   (managed values from $TOKEN / $BROKER_URL; preserv
   {
     printf 'OPENRUNG_BROKER_URL=%s\n' "$BROKER_URL"
     printf 'OPENRUNG_FOUNDATION_TOKEN=%s\n' "$TOKEN"
+    if [ -n "$FOUNDATION_CONTACT" ]; then printf 'OPENRUNG_OPERATOR_CONTACT=%s\n' "$FOUNDATION_CONTACT"; fi
+    if [ -n "$ACCESS_HOST" ] && [ "$ACCESS_HOST" != off ]; then printf 'OPENRUNG_ACCESS_HOST=%s\n' "$ACCESS_HOST"; fi
   } | ssh_run "$host" \
       "sudo sh -c 'trap \"rm -f ${ENV_FILE}.tmp\" EXIT; set -e; umask 077; cat >> ${ENV_FILE}.tmp; mv -f ${ENV_FILE}.tmp ${ENV_FILE}'"
 }
@@ -593,8 +630,16 @@ verify_foundation() { # host container
 # Commit only the verified candidate: rename it to the live name, then remove
 # the stopped old container last. A cleanup failure leaves a visible live+old
 # state that every later automation run refuses to guess about.
+#
+# ROLL_PROMOTED tells a caller whose roll failed whether the candidate went
+# live: 0 when it certainly did not (the roll failed before the commit, or the
+# commit guard refused), 1 when it did (committed, or only the old container's
+# removal failed), and "unknown" when the commit was interrupted. Whatever
+# the candidate depends on must be kept unless it is 0.
+ROLL_PROMOTED=0
 commit_candidate() {
   local host="$1" rc=0
+  ROLL_PROMOTED=unknown
   ssh_run "$host" "set -e
     names=\"\$(sudo docker ps -a --format '{{.Names}}')\" || exit 42
     old_seen=0; new_seen=0
@@ -614,6 +659,10 @@ commit_candidate() {
     ! sudo test -e ${ENV_FILE}.tmp && ! sudo test -L ${ENV_FILE}.tmp || exit 42
     sudo docker rename ${NEW_CONTAINER} ${CONTAINER}
     sudo docker rm -f ${OLD_CONTAINER} >/dev/null || exit 43" || rc=$?
+  case "$rc" in
+    0|43) ROLL_PROMOTED=1 ;;
+    42)   ROLL_PROMOTED=0 ;;
+  esac
   if [ "$rc" = 42 ]; then
     print_interrupted_state_help "$host" "candidate state changed after verification; refusing to promote or delete the old relay"
     return 1
@@ -631,6 +680,7 @@ commit_candidate() {
 
 roll_host() { # host env_file
   local host="$1" env_file="$2"
+  ROLL_PROMOTED=0
   begin_roll "$host" || return
   run_candidate "$host" "$env_file" || return
   verify_foundation "$host" "$NEW_CONTAINER" || return
@@ -705,6 +755,253 @@ apply_egress_limit() { # host
   log "new-destination limit from the relay image: ${NEW_DEST_RATE}$([ "$NEW_DEST_RATE" = off ] || printf '/s')"
 }
 
+# The access address (OPENRUNG_ACCESS_HOST) is one extra IPv6 address on the
+# interface of the host's default IPv6 route. A host unit beside the egress
+# limiter adds it at boot, before docker starts the relay, and removes it when
+# stopped. It is added deprecated (preferred_lft 0): the kernel accepts and
+# answers connections to it but never picks it as the source of a new one, so
+# registration, heartbeats and client egress stay on the primary address. The
+# relay checks exactly that before advertising it. nodad skips duplicate
+# address detection, which would otherwise hold the address tentative.
+ACCESS_UNIT_NAME=openrung-access-address.service
+ACCESS_UNIT=/etc/systemd/system/${ACCESS_UNIT_NAME}
+
+access_address_unit() { # address dev
+  cat <<UNIT
+[Unit]
+Description=OpenRung relay access address
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ip -6 address replace $1/128 dev $2 preferred_lft 0 nodad
+ExecStop=-/sbin/ip -6 address delete $1/128 dev $2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# A network manager that reconfigures the interface (systemd-networkd restarting
+# under unattended upgrades, for one) drops addresses it does not own, and the
+# one-shot unit above would stay "active" without the address. Every minute the
+# re-assert timer runs a tiny script that re-adds the address the unit names
+# (read from its ExecStart line) when it is missing or no longer deprecated,
+# and logs a warning only then; while the address is in place it is silent,
+# and LogLevelMax keeps systemd's own per-run lines out of the journal too. It
+# runs only while the unit is active, so stopping the unit (an `off` or an
+# address change) is never undone. None of the three files names the address.
+ACCESS_REASSERT_NAME=openrung-access-address-reassert
+ACCESS_REASSERT_SCRIPT=/usr/local/sbin/${ACCESS_REASSERT_NAME}
+ACCESS_REASSERT_SERVICE=/etc/systemd/system/${ACCESS_REASSERT_NAME}.service
+ACCESS_REASSERT_TIMER=/etc/systemd/system/${ACCESS_REASSERT_NAME}.timer
+
+access_reassert_script() {
+  cat <<'SCRIPT'
+#!/bin/sh
+# Re-add the access address that openrung-access-address.service configures
+# when the interface has lost it (or it lost its deprecated flag). Silent
+# while the address is in place; logs a warning only when it re-adds it.
+set -eu
+SCRIPT
+  printf 'unit=%s
+' "$ACCESS_UNIT"
+  cat <<'SCRIPT'
+set -- $(sed -n "s#^ExecStart=/sbin/ip -6 address replace \([^ ]*\)/128 dev \([^ ]*\) .*#\1 \2#p" "$unit")
+if [ "$#" -ne 2 ]; then
+  echo "<3>cannot read the access address from $unit"
+  exit 1
+fi
+if ip -6 -o address show to "$1/128" | grep -q deprecated; then
+  exit 0
+fi
+ip -6 address replace "$1/128" dev "$2" preferred_lft 0 nodad
+echo "<4>re-added access address $1 on $2"
+SCRIPT
+}
+
+access_reassert_service() {
+  cat <<UNIT
+[Unit]
+Description=Re-add the OpenRung relay access address if it is missing
+After=${ACCESS_UNIT_NAME}
+
+[Service]
+Type=oneshot
+LogLevelMax=notice
+ExecCondition=/bin/systemctl is-active --quiet ${ACCESS_UNIT_NAME}
+ExecStart=${ACCESS_REASSERT_SCRIPT}
+UNIT
+}
+
+access_reassert_timer() {
+  cat <<UNIT
+[Unit]
+Description=Re-assert the OpenRung relay access address every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# Install (idempotently) and start the re-assert timer.
+install_access_reassert() { # host
+  local host="$1"
+  access_reassert_script | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_SCRIPT}.new >/dev/null && sudo chmod 0755 ${ACCESS_REASSERT_SCRIPT}.new && sudo mv ${ACCESS_REASSERT_SCRIPT}.new ${ACCESS_REASSERT_SCRIPT}" \
+    && access_reassert_service | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_SERVICE} >/dev/null" \
+    && access_reassert_timer | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_TIMER} >/dev/null" \
+    && ssh_run "$host" "sudo systemctl daemon-reload && sudo systemctl enable --now ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1"
+}
+
+# An access address change is split around the roll so that a failure at any
+# point leaves the previous relay with exactly the addresses it had:
+#   prepare_access_address  (before the roll) adds the new address beside any
+#                           previous one, so the candidate finds it in place
+#                           at its first registration;
+#   abort_access_address    (a roll whose candidate never went live) removes
+#                           only an address this run added — the previous unit
+#                           and address are untouched; a candidate that was
+#                           promoted keeps the address (see ROLL_PROMOTED);
+#   commit_access_address   (verified roll) swaps the boot unit, restoring the
+#                           previous unit if the new one does not come up.
+# Unset OPENRUNG_ACCESS_HOST leaves the host as it is; `off` changes nothing
+# until the roll is verified, then removes the unit (and with it the address).
+ACCESS_DEV=""     # the interface prepare_access_address chose
+ACCESS_ADDED=0    # 1 when prepare_access_address added the address itself
+
+# An address the host already carries as a preferred address is refused: that
+# is a primary address, not one this script configured.
+prepare_access_address() { # host
+  local host="$1" dev out rc=0
+  ACCESS_DEV=""; ACCESS_ADDED=0
+  [ -n "$ACCESS_HOST" ] && [ "$ACCESS_HOST" != off ] || return 0
+  dev="$(ssh_run "$host" "ip -6 route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1" | scrub)" || dev=""
+  [[ "$dev" =~ $DEV_RE ]] \
+    || { echo "error: ${host}: no IPv6 default route to carry the access address (got '$(printf '%s' "$dev" | head -c 40)')" >&2; return 1; }
+  out="$(ssh_run "$host" "set -e
+    current=\$(ip -6 -o address show to ${ACCESS_HOST}/128)
+    if [ -n \"\$current\" ] && ! printf '%s' \"\$current\" | grep -q deprecated; then exit 42; fi
+    added=0
+    if [ -z \"\$current\" ]; then
+      sudo ip -6 address replace ${ACCESS_HOST}/128 dev ${dev} preferred_lft 0 nodad
+      added=1
+    fi
+    if ! ip -6 -o address show to ${ACCESS_HOST}/128 | grep -q deprecated; then
+      if [ \"\$added\" = 1 ]; then sudo ip -6 address delete ${ACCESS_HOST}/128 dev ${dev} || true; fi
+      exit 1
+    fi
+    echo \"added=\$added\"" | scrub)" || rc=$?
+  if [ "$rc" = 42 ]; then
+    echo "error: ${host}: ${ACCESS_HOST} is already a preferred address on this host (its primary address?); choose another address for OPENRUNG_ACCESS_HOST" >&2
+    return 1
+  elif [ "$rc" != 0 ]; then
+    echo "error: ${host}: could not add the access address ${ACCESS_HOST} on ${dev}; the live relay was not touched — re-run convert to retry" >&2
+    print_ssh_command "$host"
+    return 1
+  fi
+  ACCESS_DEV="$dev"
+  [ "$out" = added=1 ] && ACCESS_ADDED=1
+  log "access address: ${ACCESS_HOST} on ${dev} ($([ "$ACCESS_ADDED" = 1 ] && echo added || echo already present))"
+}
+
+abort_access_address() { # host
+  local host="$1"
+  [ "$ACCESS_ADDED" = 1 ] || return 0
+  ACCESS_ADDED=0
+  ssh_run "$host" "sudo ip -6 address delete ${ACCESS_HOST}/128 dev ${ACCESS_DEV}" \
+    && log "access address: removed ${ACCESS_HOST}, which this run added; the previous relay keeps its addresses" \
+    || warn "${host}: could not remove ${ACCESS_HOST}, which this run added; remove it by hand (ip -6 address delete ${ACCESS_HOST}/128 dev ${ACCESS_DEV})"
+  return 0
+}
+
+commit_access_address() { # host
+  local host="$1" rc=0
+  [ -n "$ACCESS_HOST" ] || return 0
+  if [ "$ACCESS_HOST" = off ]; then
+    ssh_run "$host" "set -e
+      if sudo test -f ${ACCESS_REASSERT_TIMER} || sudo test -f ${ACCESS_REASSERT_SERVICE}; then
+        sudo systemctl disable --now ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1 || true
+        sudo systemctl stop ${ACCESS_REASSERT_NAME}.service >/dev/null 2>&1 || true
+        sudo rm -f ${ACCESS_REASSERT_TIMER} ${ACCESS_REASSERT_SERVICE} ${ACCESS_REASSERT_SCRIPT}
+        sudo systemctl daemon-reload
+      fi
+      if sudo test -f ${ACCESS_UNIT}; then
+        sudo systemctl disable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
+        sudo rm -f ${ACCESS_UNIT}
+        sudo systemctl daemon-reload
+      fi" \
+      || { echo "error: ${host}: the relay is live without an access address, but the access address unit could not be removed; re-run convert" >&2; print_ssh_command "$host"; return 1; }
+    log "access address: removed"
+    return 0
+  fi
+  [[ "$ACCESS_DEV" =~ $DEV_RE ]] \
+    || { echo "error: ${host}: internal: the access address was not prepared before the roll" >&2; return 1; }
+  # Stopping a previous unit runs its ExecStop, which removes the PREVIOUS
+  # address only; it is skipped when that unit already names this address,
+  # which the relay is now serving.
+  access_address_unit "$ACCESS_HOST" "$ACCESS_DEV" | ssh_run "$host" "
+    unit=\$(cat)
+    printf '%s\\n' \"\$unit\" | sudo tee ${ACCESS_UNIT}.new >/dev/null || exit 1
+    if sudo test -f ${ACCESS_UNIT} && sudo cmp -s ${ACCESS_UNIT}.new ${ACCESS_UNIT}; then
+      sudo rm -f ${ACCESS_UNIT}.new
+      sudo systemctl enable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || exit 1
+      exit 0
+    fi
+    had_old=0
+    # A re-assert run that read the old unit could re-add its address after
+    # the stop below removes it: stop the timer and wait out a run in
+    # progress (systemctl stop returns once it has exited) before any
+    # address is touched. install_access_reassert starts the timer again.
+    sudo systemctl stop ${ACCESS_REASSERT_NAME}.timer ${ACCESS_REASSERT_NAME}.service >/dev/null 2>&1 || true
+    if sudo test -f ${ACCESS_UNIT}; then
+      had_old=1
+      sudo cp -p ${ACCESS_UNIT} ${ACCESS_UNIT}.old || exit 1
+      if ! sudo grep -q 'address replace ${ACCESS_HOST}/128 ' ${ACCESS_UNIT}; then
+        sudo systemctl stop ${ACCESS_UNIT_NAME} || true
+      fi
+    fi
+    if sudo mv ${ACCESS_UNIT}.new ${ACCESS_UNIT} && sudo systemctl daemon-reload \\
+       && sudo systemctl enable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 \\
+       && ip -6 -o address show to ${ACCESS_HOST}/128 | grep -q deprecated; then
+      sudo rm -f ${ACCESS_UNIT}.old
+      exit 0
+    fi
+    sudo rm -f ${ACCESS_UNIT}.new
+    if [ \"\$had_old\" = 1 ]; then
+      sudo mv ${ACCESS_UNIT}.old ${ACCESS_UNIT}
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
+      if sudo test -f ${ACCESS_REASSERT_TIMER}; then sudo systemctl start ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1 || true; fi
+    else
+      sudo systemctl disable ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
+      sudo rm -f ${ACCESS_UNIT}
+      sudo systemctl daemon-reload
+    fi
+    exit 43" || rc=$?
+  if [ "$rc" = 43 ]; then
+    echo "error: ${host}: the relay is live on ${ACCESS_HOST}, but its boot unit did not start; the previous unit was restored, so a reboot would not keep ${ACCESS_HOST} — re-run convert" >&2
+    print_ssh_command "$host"
+    return 1
+  elif [ "$rc" != 0 ]; then
+    echo "error: ${host}: the relay is live on ${ACCESS_HOST}, but its boot unit could not be installed; re-run convert" >&2
+    print_ssh_command "$host"
+    return 1
+  fi
+  install_access_reassert "$host" \
+    || { echo "error: ${host}: the access address unit is in place, but its re-assert timer could not be installed, so a network reconfiguration could drop ${ACCESS_HOST}; re-run convert" >&2
+         print_ssh_command "$host"
+         return 1; }
+  log "access address: ${ACCESS_HOST} kept by ${ACCESS_UNIT_NAME}, re-asserted every minute"
+}
+
 convert_host() {
   local host="$1" ident public_host label
   echo "==> convert ${host}"
@@ -728,7 +1025,20 @@ convert_host() {
   log "identity: label=${label:--} public_host=${public_host} (preserved)"
   install_env_file "$host" || return
   log "wrote ${ENV_FILE} (root:root 0600; existing settings preserved, broker URL + token updated)"
-  roll_host "$host" "$ENV_FILE" || return
+  prepare_access_address "$host" || return
+  if ! roll_host "$host" "$ENV_FILE"; then
+    # Only a candidate that never went live leaves the previous relay in
+    # charge, so only then is the access change undone. A promoted candidate
+    # (only the old container's removal failed) serves the new address, so
+    # its unit is still committed; an interrupted commit keeps the address.
+    case "$ROLL_PROMOTED" in
+      0) abort_access_address "$host" ;;
+      1) commit_access_address "$host" || true ;;
+      *) [ "$ACCESS_ADDED" = 1 ] && warn "${host}: the roll was interrupted after promotion began; kept ${ACCESS_HOST}, which the live relay may be serving" ;;
+    esac
+    return 1
+  fi
+  commit_access_address "$host" || return
   apply_egress_limit "$host" || return
 }
 
@@ -821,8 +1131,9 @@ cmd_create() {
 # Read-only. Per host: the running relay's version, whether the saved host
 # ruleset is exactly what that relay's own image renders at OPENRUNG_NEW_DEST_RATE,
 # whether the installed egress-limit script is that image's copy, whether the
-# host has the nftables it needs, whether the table is loaded, and whether the
-# boot unit is enabled. Everything
+# host has the nftables it needs, whether the table is loaded, whether the
+# boot unit is enabled, and the access address the env file names: none, or
+# whether it is present (and deprecated) with its unit enabled. Everything
 # printed comes back from the host, so it is scrubbed before display.
 cmd_audit() {
   [ "$#" -ge 1 ] || usage
@@ -863,9 +1174,19 @@ cmd_audit() {
       else
         echo host_nft=yes loaded=no
       fi
-      echo \"unit=\$(systemctl is-enabled openrung-egress-limit.service 2>/dev/null || echo missing)\"" 2>/dev/null)" \
+      echo \"unit=\$(systemctl is-enabled openrung-egress-limit.service 2>/dev/null || echo missing)\"
+      access=\$(sudo sed -n 's/^OPENRUNG_ACCESS_HOST=//p' ${ENV_FILE} 2>/dev/null | tail -1)
+      if [ -z \"\$access\" ]; then
+        echo access=none
+      else
+        current=\$(ip -6 -o address show to \"\$access/128\" 2>/dev/null)
+        if [ -z \"\$current\" ]; then state=missing
+        elif printf '%s' \"\$current\" | grep -q deprecated; then state=present
+        else state=preferred; fi
+        echo \"access=\$access access_state=\$state access_unit=\$(systemctl is-enabled ${ACCESS_UNIT_NAME} 2>/dev/null || echo missing) access_reassert=\$(systemctl is-active ${ACCESS_REASSERT_NAME}.timer 2>/dev/null || echo missing)\"
+      fi" 2>/dev/null)" \
       || out="unreachable"
-    printf '%s %s\n' "$host" "$(printf '%s' "$out" | scrub_stream | tr '\n' ' ' | head -c 300)"
+    printf '%s %s\n' "$host" "$(printf '%s' "$out" | scrub_stream | tr '\n' ' ' | head -c 500)"
   done
 }
 

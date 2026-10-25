@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -55,6 +56,11 @@ type RegisterRequest struct {
 	MaxMbps          int    `json:"max_mbps"`
 	RelayVersion     string `json:"relay_version"`
 	Label            string `json:"label,omitempty"`
+	// OperatorContact is the email address the operator asked to be reached
+	// at about this relay. Optional, private registration material: the broker stores it for the operator views and
+	// never serves it in the public directory. Not bound by the identity
+	// statement, so relays that predate it register unchanged.
+	OperatorContact string `json:"operator_contact,omitempty"`
 	// NodeClass declares who operates this relay: NodeClassVolunteer (the
 	// default when empty) or NodeClassFoundation. A foundation claim is only
 	// honored when the request presents the broker's foundation token;
@@ -107,6 +113,14 @@ type RegisterRequest struct {
 	// identity-bearing registrations can be lease-capable, because the sync
 	// endpoints authenticate with the registration's lease token.
 	AccessLeases bool `json:"access_leases,omitempty"`
+	// AccessHost is an optional IPv6 literal, distinct from PublicHost, that
+	// the relay serves on the same listener and that the broker may hand out
+	// in place of PublicHost in its access answer (ADR-006.1 Part A). The
+	// relay sends it only after confirming the address is configured on a
+	// host interface. Private registration material like OperatorContact:
+	// never part of the public directory, and not bound by the identity
+	// statement, so relays without it register unchanged.
+	AccessHost string `json:"access_host,omitempty"`
 }
 
 // MarshalJSON emits the canonical key plus the deprecated v1 alias so upgraded
@@ -191,6 +205,24 @@ type Descriptor struct {
 	// broker to pick relays that can install per-client credentials, never
 	// serialized into the public directory.
 	LeaseCapable bool `json:"-"`
+	// OperatorContact is the registration's optional operator contact. It is
+	// shown only in the operator inventory and relays page; serializing it
+	// into the public directory would publish every operator's address.
+	OperatorContact string `json:"-"`
+	// AccessHost is the IPv6 access address an identity-bearing registration
+	// advertised (empty otherwise). The broker substitutes it for PublicHost
+	// in the per-user access answer only; the public directory, the signed
+	// relay lists and the reachability probe keep PublicHost, and only the
+	// operator views show it.
+	AccessHost string `json:"-"`
+	// Reachable and ReachabilityCheckedAt record the broker's latest inbound
+	// probe of the advertised endpoint (direct transport only). A zero
+	// ReachabilityCheckedAt means no probe has run; Reachable is meaningful
+	// only beside a non-zero timestamp. Operational state for the broker's
+	// own listing decision and the operator views; never part of the signed
+	// public directory.
+	Reachable             bool      `json:"-"`
+	ReachabilityCheckedAt time.Time `json:"-"`
 	// NodeClass is the broker-attested operator class (NodeClassFoundation or
 	// NodeClassVolunteer). Always serialized, and covered by the relay-list
 	// signature like every other descriptor field; clients that predate it
@@ -218,23 +250,33 @@ type Descriptor struct {
 // RegisterResponse is the private response to a successful registration. It
 // has the same wire shape as Descriptor plus lease_token; keeping the token out
 // of Descriptor's JSON representation prevents it from leaking through signed
-// public relay-list responses.
+// public relay-list responses. It also reports the broker's registration-time
+// reachability probe as reachable (absent when the broker did not probe), so a
+// relay operator can see from the registration itself whether clients will be
+// handed the relay.
 type RegisterResponse struct {
 	Descriptor Descriptor
 }
 
 func (r RegisterResponse) MarshalJSON() ([]byte, error) {
 	type descriptorAlias Descriptor
+	var reachable *bool
+	if !r.Descriptor.ReachabilityCheckedAt.IsZero() {
+		value := r.Descriptor.Reachable
+		reachable = &value
+	}
 	return json.Marshal(struct {
 		descriptorAlias
 		VolunteerVersion string `json:"volunteer_version"`
 		LeaseToken       string `json:"lease_token,omitempty"`
 		AccessLeases     bool   `json:"access_leases,omitempty"`
+		Reachable        *bool  `json:"reachable,omitempty"`
 	}{
 		descriptorAlias:  descriptorAlias(r.Descriptor),
 		VolunteerVersion: r.Descriptor.RelayVersion,
 		LeaseToken:       r.Descriptor.LeaseToken,
 		AccessLeases:     r.Descriptor.LeaseCapable,
+		Reachable:        reachable,
 	})
 }
 
@@ -409,6 +451,56 @@ func NormalizeNodeClass(class string) (string, error) {
 	default:
 		return "", fmt.Errorf("node_class must be %q or %q", NodeClassVolunteer, NodeClassFoundation)
 	}
+}
+
+// MaxOperatorContactLength bounds the operator-supplied contact.
+const MaxOperatorContactLength = 128
+
+// NormalizeOperatorContact trims and validates an operator-supplied contact.
+// An empty contact is allowed and returns "". Otherwise it must be an email
+// address in a lenient shape: printable ASCII without spaces, exactly one
+// "@" with a non-empty local part, and a domain containing a dot that neither
+// starts nor ends it. The installers apply the same rule
+// (deploy/relay/volunteer-up.sh validate_contact).
+func NormalizeOperatorContact(contact string) (string, error) {
+	contact = strings.TrimSpace(contact)
+	if contact == "" {
+		return "", nil
+	}
+	if len(contact) > MaxOperatorContactLength {
+		return "", fmt.Errorf("operator_contact must be at most %d characters", MaxOperatorContactLength)
+	}
+	for i := 0; i < len(contact); i++ {
+		if contact[i] < '!' || contact[i] > '~' {
+			return "", errors.New("operator_contact must be an email address (printable ASCII, no spaces)")
+		}
+	}
+	local, domain, ok := strings.Cut(contact, "@")
+	if !ok || local == "" || strings.Contains(domain, "@") ||
+		!strings.Contains(domain, ".") || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return "", errors.New("operator_contact must be an email address")
+	}
+	return contact, nil
+}
+
+// NormalizeAccessHost validates an access host and returns its canonical
+// spelling. Empty is allowed and returns "". Otherwise it must be a bare IPv6
+// literal (no brackets, zone, or IPv4-mapped form) that is a global unicast,
+// non-private address: the access address is something clients on the
+// internet dial, so nothing else is meaningful.
+func NormalizeAccessHost(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", nil
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !addr.Is6() || addr.Is4In6() || addr.Zone() != "" {
+		return "", errors.New("access_host must be an IPv6 address literal")
+	}
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return "", errors.New("access_host must be a global unicast IPv6 address")
+	}
+	return addr.String(), nil
 }
 
 // MaxLabelLength bounds the operator-supplied relay label.

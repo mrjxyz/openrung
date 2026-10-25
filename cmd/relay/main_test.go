@@ -29,6 +29,7 @@ var relayEnvironmentVariables = []string{
 	"OPENRUNG_VOLUNTEER_TOKEN",
 	"OPENRUNG_FOUNDATION_TOKEN",
 	"OPENRUNG_LABEL",
+	"OPENRUNG_OPERATOR_CONTACT",
 	"OPENRUNG_NODE_CLASS",
 	"OPENRUNG_WSS_FRONTS",
 	"OPENRUNG_MODE",
@@ -40,6 +41,7 @@ var relayEnvironmentVariables = []string{
 	"OPENRUNG_CREDENTIAL_ROTATION",
 	"OPENRUNG_CREDENTIAL_EPOCH",
 	"OPENRUNG_ACCESS_LEASES",
+	"OPENRUNG_ACCESS_HOST",
 }
 
 // parseFlags runs the real registration and parsing path, so what these tests
@@ -74,6 +76,7 @@ func TestFlagSurfaceAndDefaultsAreStable(t *testing.T) {
 		"broker":               "http://localhost:8080",
 		"registration-token":   "",
 		"label":                "",
+		"operator-contact":     "",
 		"node-class":           "",
 		"foundation-token":     "",
 		"xray":                 "xray",
@@ -81,6 +84,7 @@ func TestFlagSurfaceAndDefaultsAreStable(t *testing.T) {
 		"listen-port":          "443",
 		"public-host":          "",
 		"public-port":          "443",
+		"access-host":          "",
 		"server-name":          "www.cloudflare.com",
 		"reality-dest":         "www.cloudflare.com:443",
 		"client-id":            "",
@@ -93,7 +97,7 @@ func TestFlagSurfaceAndDefaultsAreStable(t *testing.T) {
 		"max-mbps":             strconv.Itoa(relayruntime.DefaultMaxMbps),
 		"heartbeat-interval":   "30s",
 		"config-out":           "",
-		"connection-log":       "true",
+		"connection-log":       "false",
 		"print-config-only":    "false",
 		"skip-xray-run":        "false",
 		"mode":                 "",
@@ -183,6 +187,9 @@ func TestDeployedDirectFlagsMapOntoEngineConfig(t *testing.T) {
 	// per-connection client addresses at all, not merely a quiet writer.
 	if cfg.ConnectionLogOutput != nil {
 		t.Error("connection-log=false still handed the engine a log writer")
+	}
+	if cfg.ObserveConnections {
+		t.Error("connection-log=false still put the connection observer in front of xray")
 	}
 	if cfg.ServerName != "www.example.com" || cfg.RealityDest != "www.example.com:443" {
 		t.Errorf("camouflage = %q/%q", cfg.ServerName, cfg.RealityDest)
@@ -806,5 +813,57 @@ func TestAccessLeasesFlagMapsOntoEngineConfig(t *testing.T) {
 		if cfg.DisableAccessLeases != wantDisabled {
 			t.Errorf("OPENRUNG_ACCESS_LEASES=%q: leases disabled = %v, want %v", value, cfg.DisableAccessLeases, wantDisabled)
 		}
+	}
+}
+
+// Server relays let xray own the public port: only an explicit -connection-log
+// puts the observer proxy in front of it, and then with stdout to write to.
+func TestConnectionLogFlagMapsOntoObserving(t *testing.T) {
+	cfg, err := parseFlags(t, "-mode", "direct").engineConfig()
+	if err != nil {
+		t.Fatalf("engineConfig: %v", err)
+	}
+	if cfg.ObserveConnections || cfg.ConnectionLogOutput != nil {
+		t.Fatalf("default config observes connections (observe=%v, log=%v)", cfg.ObserveConnections, cfg.ConnectionLogOutput != nil)
+	}
+	cfg, err = parseFlags(t, "-mode", "direct", "-connection-log").engineConfig()
+	if err != nil {
+		t.Fatalf("engineConfig: %v", err)
+	}
+	if !cfg.ObserveConnections || cfg.ConnectionLogOutput != os.Stdout {
+		t.Fatalf("-connection-log: observe=%v, log is stdout=%v; want both", cfg.ObserveConnections, cfg.ConnectionLogOutput == os.Stdout)
+	}
+}
+
+// The access host is read from OPENRUNG_ACCESS_HOST (no entrypoint mapping),
+// and the flag wins over it like every other env-backed default.
+func TestAccessHostFlagMapsOntoEngineConfig(t *testing.T) {
+	cfg, err := parseFlags(t, "-mode", "direct").engineConfig()
+	if err != nil {
+		t.Fatalf("engineConfig: %v", err)
+	}
+	if cfg.AccessHost != "" {
+		t.Fatalf("default access host = %q, want none", cfg.AccessHost)
+	}
+	cfg, err = parseFlags(t, "-mode", "direct", "-access-host", "2001:db8:1::10").engineConfig()
+	if err != nil {
+		t.Fatalf("engineConfig: %v", err)
+	}
+	if cfg.AccessHost != "2001:db8:1::10" {
+		t.Fatalf("-access-host = %q", cfg.AccessHost)
+	}
+	for _, name := range relayEnvironmentVariables {
+		t.Setenv(name, "")
+	}
+	t.Setenv("OPENRUNG_ACCESS_HOST", "2001:db8:1::20")
+	flags := &cliFlags{}
+	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flags.register(fs, "")
+	if err := fs.Parse([]string{"-mode", "direct"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg, err := flags.engineConfig(); err != nil || cfg.AccessHost != "2001:db8:1::20" {
+		t.Fatalf("OPENRUNG_ACCESS_HOST not passed through: %q, %v", cfg.AccessHost, err)
 	}
 }

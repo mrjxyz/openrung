@@ -7,7 +7,7 @@ All API paths are currently versioned under `/api/v1`.
 The unauthenticated endpoints (`GET /api/v1/relays`, `POST
 /api/v1/wss/tickets`, `POST /api/v1/users/challenge`, `POST
 /api/v1/users/auth`, `POST /api/v1/telemetry/events`, and `GET
-/api/v1/speed-test`) are rate limited. Requests over the budget receive `429
+/api/v1/speed-test`) and `POST /api/v1/access` are rate limited. Requests over the budget receive `429
 Too Many Requests` with a `Retry-After` header (seconds); clients should back
 off and retry only within their bounded operation deadline. Most endpoints use
 the real client IP resolved through trusted proxies. WSS ticket requests also
@@ -15,6 +15,14 @@ use a bounded, hashed `X-OpenRung-Client-ID` component when it is well formed,
 so legitimate clients behind one carrier-grade NAT address do not all consume
 one bucket. That identifier is not authentication, so relay-side admission
 limits remain mandatory.
+
+Each of these per-client budgets is broker-host configuration, set as
+`<per-second rate>:<burst>` in `OPENRUNG_RATE_LIMIT_RELAY_LIST`,
+`OPENRUNG_RATE_LIMIT_WSS_TICKET`, `OPENRUNG_RATE_LIMIT_USER_AUTH`,
+`OPENRUNG_RATE_LIMIT_ACCESS`, `OPENRUNG_RATE_LIMIT_TELEMETRY`,
+`OPENRUNG_RATE_LIMIT_SPEED_TEST` and `OPENRUNG_RATE_LIMIT_RELAY_REGISTRATION`
+(registration, heartbeat and lease polling share one budget). Clients must not
+assume any particular budget; they react only to `429` and `Retry-After`.
 
 The credentialed operational endpoint `GET /admin/api/relays/inventory` is rate
 limited the same way, on a tighter budget: authentication bounds who may call
@@ -219,6 +227,42 @@ cohort.
 | `recovery` | The WSS monitor re-running the ladder after a session ended. |
 | `network_epoch` | A connectivity-change reconnect. |
 
+#### Per-user access attributes
+
+Clients that carry the access flow (connectcore 0.7.1 and later) stamp two
+attributes on their terminal connect events, so the broker can see how the
+per-user access path went without a dedicated event. Both are closed token
+sets, pinned by `connectcore/contract/vectors/access_outcome.json`; the
+dashboard's "Per-user access" panel groups by them.
+
+`access_outcome` rides on `connection_succeeded` and `connection_failed` and
+names what the connect did about per-user access. It is absent when the
+connect ended before the relay fetch decided (a local setup failure, a cancel
+during discovery) and on clients that predate it.
+
+| Value | Meaning |
+| --- | --- |
+| `granted` | The access answer was the candidate list the connect used. |
+| `no_key` | The installation has no key; the public list was used without asking. |
+| `not_requested` | A key exists but the target cannot be expressed to the access endpoint (a label-only target); the public list was used. |
+| `unsupported` | The broker has no user/access endpoints; the public list was used. |
+| `front_unbound` | The reachable front cannot carry an authenticated request (the no-SNI mode); the public list was used. |
+| `denied` | The broker refused the installation (`403`); the connect failed with `failure_stage` `access_denied`. |
+| `unapplied` | Leases were issued but no relay installed them within the bounded retries (`503`); the public list was used. |
+| `rate_limited` | The access request was rate limited (`429`); the public list was used. |
+| `empty` | The answer named no relay the ladder could use for the target; the public list was used. |
+| `error` | Any other failure of the access request; the public list was used. |
+| `fallback_public` | Access was granted, every leased candidate failed remotely, and a public-list relay carried the connect. |
+| `enrollment_refused` | The broker refused to enroll this not-yet-enrolled installation from the current network (`403` with code `datacenter_source`); the public list was used. Clients from connectcore 0.8.0. |
+
+`relay_source` rides on `connection_succeeded` only: `access` when the
+connected relay's descriptor and credential came from the access answer (a
+per-user lease), `public` when they came from the public list (the shared
+credential). The share of `access` among successes is the adoption measure
+enforcement waits on; every value other than `granted`/`fallback_public` in
+`access_outcome` is a connect the public list carried and enforcement would
+have failed.
+
 #### Reading these rows
 
 Aggregate before reading: per country, ASN, front, and app-version **shares** —
@@ -254,23 +298,33 @@ Set `OPENRUNG_DASHBOARD_TOKEN` on the broker to enable the administrator
 dashboard at:
 
 ```http
-GET /admin/telemetry
+GET /admin/dashboard
 ```
 
-The dashboard requires the configured token, creates an HttpOnly administrator
-session lasting 12 hours, and refreshes its operational overview every 30
-seconds. It supports one-hour, 24-hour, and seven-day windows. The JSONL file
-remains the durable telemetry store; the broker retains the most recent seven
-days in memory for dashboard queries, capped at a 64 MiB budget that discards
-the oldest records first if a burst of telemetry would exceed it.
+The dashboard requires the configured token (sign-in at
+`/admin/dashboard/login`) and creates an HttpOnly administrator session lasting
+12 hours. A left sidebar switches between the Overview and Relays pages and
+names the running broker version; the top bar picks the one-hour, 24-hour,
+seven-day, 14-day, or 31-day window (carried in the URL as `?window=`) and an
+optional auto-refresh. The JSONL file remains the durable telemetry store; the
+broker retains the most recent seven days in memory for dashboard queries,
+capped at a 64 MiB budget that discards the oldest records first if a burst of
+telemetry would exceed it.
 
 The authenticated dashboard reads its data from:
 
 ```http
-GET /admin/api/telemetry/overview?window=24h
+GET /admin/api/dashboard/overview?window=24h
 ```
 
-Valid windows are `1h`, `24h`, and `7d`. When the dashboard token is unset, all
+Valid windows are `1h`, `24h`, `7d`, `14d`, and `31d`. The trend is bucketed by
+hour up to `7d` and by UTC day beyond. Raw events are kept for seven days, so
+only the Postgres telemetry store serves the two longer windows in full: its
+dashboard rollup (one row per session plus hourly event counts) is kept for 31
+days, and sessions older than seven days keep their counts but lose their
+client IPs, city, ISP, organization, and ASN, which then render blank. Top
+applications cover at most the last seven days. The JSONL store answers every
+window with the seven days it retains. When the dashboard token is unset, all
 dashboard routes return 404. Production deployments should use HTTPS directly
 or through a reverse proxy.
 
@@ -278,7 +332,7 @@ The overview embeds only the 25 most recent sessions; the full session list for
 a window is paged through:
 
 ```http
-GET /admin/api/telemetry/sessions?window=24h&offset=0&limit=25
+GET /admin/api/dashboard/sessions?window=24h&offset=0&limit=25
 ```
 
 `offset` is the zero-based position into the window's sessions ordered newest
@@ -313,11 +367,11 @@ breakdowns are available by relay, country, city, ISP, and operating system.
 
 ### Relays page
 
-The dashboard links to a dedicated relay-fleet page at `/admin/telemetry/relays`,
+The sidebar links to a dedicated relay-fleet page at `/admin/dashboard/relays`,
 backed by:
 
 ```http
-GET /admin/api/telemetry/relays?window=24h
+GET /admin/api/dashboard/relays?window=24h
 ```
 
 The response merges the live relay registry with the window's telemetry. Fleet
@@ -329,7 +383,7 @@ registered (`offline_relays`), live sessions across the fleet, and the distinct
 count of clients currently connected through any relay.
 
 Each relay row carries the registry half for online relays — label, class,
-public endpoint, transport, exit location (city/country as resolved by the
+public endpoint, access address and operator contact (when the relay registered them), transport, exit location (city/country as resolved by the
 broker), relay software version, capacity, punch/WSS capability, registration
 and last-heartbeat times — merged with per-relay telemetry for the window:
 currently connected clients and active sessions, unique clients and sessions,
@@ -350,6 +404,43 @@ neither mint offline rows nor inflate the connected-clients count. As a
 second bound, the response lists at most 200 offline rows (the busiest); the
 totals still count every attested offline relay, and the page notes when rows
 were hidden.
+
+### Users page
+
+The sidebar's Users page (`/admin/dashboard/users`) is the operator's view of
+[client users](#client-users-spec-openrung-user-auth-v1) and their
+[access leases](#relay-lease-sync), backed by:
+
+```http
+GET /admin/api/dashboard/users?status=&sort=last_auth&offset=0&limit=50
+GET /admin/api/dashboard/users/{ref}
+PUT /admin/api/dashboard/users/{id}/status
+```
+
+The list takes the same parameters and returns the same rows as the
+[operational list](#operational-user-endpoints). `{ref}` on the detail route is
+a user ID, a lease label as relays log it (`lease-<id>`), or a bare lease ID,
+which resolves to the lease's owner (`matched_lease` names it), so an operator
+can go from a relay log line to the user. The detail carries the user's row
+(status timeline and lease counters), its 50 most recently created retained
+leases with each lease's status (`live`, `expired`, `revoked`) and the relay's
+label while the relay is registered, `leases_total`, and
+`lease_retention_days` (leases are deleted seven days after they expire).
+Unknown, malformed and retention-expired references are `404`.
+
+The status route is the same implementation as the operational
+`PUT /admin/api/users/{id}/status` — same body, validation and response —
+behind the dashboard session instead of the token, with the
+[dashboard mutation guards](#dashboard-weight-endpoints) (`415` without a JSON
+content type, `403` cross-origin). Each change is logged on the one
+`user status changed` line, whose `via` field names the door (`dashboard` or
+`operational api`). The page requires a reason and a confirmation before it
+disables a user, and states that disabling stops new connections within
+seconds (live leases are revoked and relays drop them on their next sync) but
+does not terminate an established session. Responses never include public
+keys, lease credentials, client source addresses or telemetry identifiers.
+Without client users configured (`OPENRUNG_USER_TOKEN_KEY`) these routes
+answer `503`.
 
 ## Operational relay inventory
 
@@ -407,12 +498,22 @@ replayed into a client's API slot. `not_after` is `server_time` + 5
 minutes, far tighter than the API channel's 30: a relay lease lives about three
 minutes, so a stale inventory describes a fleet that no longer exists.
 
-The relay objects are the public directory descriptors plus one operator-only
-key, `ranking_weight` — the effective ranking weight the broker is applying to
+The relay objects are the public directory descriptors plus operator-only
+keys: `ranking_weight` — the effective ranking weight the broker is applying to
 that relay right now (`1` unless an override is stored; see
-[Relay ranking weights](#relay-ranking-weights)). Lease tokens, stable-identity
-keys and proofs, hub-observed exit addresses, telemetry, and signing seeds never
-appear here; the endpoint exposes fleet membership, not credentials.
+[Relay ranking weights](#relay-ranking-weights)) — and the latest [inbound
+reachability probe](#inbound-reachability-probe): `reachable` is `null` until
+the broker has probed the relay (tunnel transport, probing off, or not yet),
+otherwise `true` or `false`, with `reachability_checked_at` giving the probe
+time when there is one. A `false` relay is registered but withheld from
+clients. `operator_contact` is the contact the relay registered with and
+`access_host` its access address (see [Register Relay](#register-relay));
+each is omitted when the relay sent none, and both appear only in this
+trailing operator block, never in the descriptor fields the inventory shares
+with the public directory. Lease
+tokens, stable-identity keys and proofs, hub-observed exit addresses,
+telemetry, and signing seeds never appear here; the endpoint exposes fleet
+membership, not credentials.
 
 Response:
 
@@ -424,7 +525,7 @@ Response:
   "key_id": "3097e2dee2cb4a34",
   "channel": "inventory",
   "relays": [
-    { "id": "relay_0a1b...", "public_host": "203.0.113.7", "public_port": 443, "node_class": "foundation", "...": "...", "ranking_weight": 1 }
+    { "id": "relay_0a1b...", "public_host": "203.0.113.7", "public_port": 443, "node_class": "foundation", "...": "...", "ranking_weight": 1, "reachable": true, "reachability_checked_at": "2026-06-09T06:58:00Z", "operator_contact": "ops@example.org", "access_host": "2001:db8:1::10" }
   ]
 }
 ```
@@ -439,10 +540,13 @@ Authorization: Bearer <OPENRUNG_API_TOKEN>
 ```
 
 An operator-set per-relay multiplier on the candidate ranking behind
-`GET /api/v1/relays`: a number in `[0, 1]`, default `1`, applied last to the
-relay's telemetry-derived score. `1` leaves the ranking untouched, values below
-`1` demote the relay in proportion, and `0` pins it to the bottom of every page
-without delisting it — and excludes the relay from the WSS-candidate
+`GET /api/v1/relays`: a number in `[0, 1]`, default `1`. The broker orders each
+response by weighted random sampling, so relays with similar telemetry-derived
+scores share the head of the page instead of one taking every client; the
+weight multiplies a relay's sampling weight. `1` leaves the ranking untouched,
+values below `1` reduce the relay's share of page heads in proportion (`0.5`
+halves its odds against an otherwise equal relay), and `0` pins it to the
+bottom of every page without delisting it — and excludes the relay from the WSS-candidate
 reservation that can otherwise promote a WSS-capable Foundation relay into a
 short page's last slot (weights above `0` keep that eligibility). Weights key on
 the relay ID, so they survive lease expiry and re-registration, and are never
@@ -483,12 +587,12 @@ the relay ID, old and new weight, and the caller's IP.
 
 ### Dashboard weight endpoints
 
-The relays page (`/admin/telemetry/relays`) edits the same weights through the
+The relays page (`/admin/dashboard/relays`) edits the same weights through the
 dashboard session cookie rather than the operational token:
 
 ```http
-PUT    /admin/api/telemetry/relays/{id}/weight
-DELETE /admin/api/telemetry/relays/{id}/weight
+PUT    /admin/api/dashboard/relays/{id}/weight
+DELETE /admin/api/dashboard/relays/{id}/weight
 ```
 
 Validation and responses match the operational routes. Because the session is
@@ -500,7 +604,7 @@ only in its absence is the `Origin` header's host compared with `Host`. Fetch
 metadata is used first because a CDN front rewrites `Host` to the origin
 hostname, which would make the `Origin` comparison refuse every legitimate
 request through the front. Together with the cookie's `SameSite=Strict` this
-keeps a visited page from moving the dial. Each row of `GET /admin/api/telemetry/relays` carries the
+keeps a visited page from moving the dial. Each row of `GET /admin/api/dashboard/relays` carries the
 relay's effective `ranking_weight`, offline rows included.
 
 ## Health
@@ -525,6 +629,10 @@ it is public data that already ships in every relay-list response.
 `wss_ticket_key_id` is present only when WSS ticket issuance is configured and
 identifies the broker's active ticket signer, allowing operators to confirm the
 matching public key is installed on relay-local sidecars.
+`source_classification_available` is present only when datacenter source
+classification is configured (see Client users): `false` while its data is
+missing or older than `OPENRUNG_SOURCE_ASN_MAX_AGE`, when new enrollments are
+answered with `503`. It does not affect `ok` or the status code.
 
 When the broker uses PostgreSQL relay state, `/healthz` also verifies database
 connectivity. If relay state is unavailable, it returns `503` with an error
@@ -557,7 +665,10 @@ count, so stable-identity relays and tunnel relays reconnecting through the
 hub are unaffected, and the budget is only consumed by registrations the
 broker accepts, so a relay crash-looping on a rejected request cannot exhaust
 it. Requests over the cap receive `429` with a `Retry-After` header, which the
-relay runtime honors with backoff. Sources listed in
+relay runtime honors with backoff. A direct relay whose advertised endpoint
+the broker cannot connect to is refused with `422` before anything is stored
+(see [Inbound reachability probe](#inbound-reachability-probe)); that
+refusal does not consume the cap either. Sources listed in
 `OPENRUNG_REGISTRATION_CAP_EXEMPT_CIDRS` (comma-separated CIDRs) are exempt —
 set this to the relay hub's egress addresses so a wave of first-time tunnel
 volunteers is never throttled — and requests presenting the foundation token
@@ -584,9 +695,38 @@ Request:
   "relay_version": "relay/0.1.0",
   "transport": "direct",
   "node_class": "volunteer",
-  "access_leases": true
+  "access_leases": true,
+  "operator_contact": "ops@example.org",
+  "access_host": "2001:db8:1::10"
 }
 ```
+
+`operator_contact` (optional) is the email address the relay's operator asked
+to be reached at about the relay. It must be at most 128 printable ASCII
+characters without whitespace, with exactly one `@`, a non-empty local part and
+a domain containing a dot that neither starts nor ends it; anything else is
+refused with `400`.
+Registrations without it are accepted unchanged. The broker stores it with the
+registration and shows it only in the [operational relay
+inventory](#operational-relay-inventory) and the admin relays page: it is not
+bound by the identity statement and never appears in the registration response,
+relay lists, or any signed client-facing body.
+
+`access_host` (optional) is an IPv6 address, distinct from `public_host`, on
+which the relay serves the same listener. It must be a bare global unicast
+IPv6 literal (no brackets, zone or IPv4-mapped form, not unique-local), may not
+name the same address as `public_host`, and is accepted for direct transport
+only; anything else is refused with `400`. It is honoured only for
+identity-bearing registrations (a legacy identityless registration's is
+dropped) and is replaced, or cleared, by every re-registration; heartbeats
+keep it. It is not bound by the identity statement. The broker uses it in one
+place: the [client access](#client-access) answer to a request that arrived
+over IPv6 names it as the relay's `public_host`. The registration response, relay lists, the [inbound
+reachability probe](#inbound-reachability-probe) and every other surface keep
+`public_host`; only the operator inventory and the admin relays page show the
+access address. The reference relay sends it (`OPENRUNG_ACCESS_HOST`) only after
+confirming the address is configured on a host interface; see
+`deploy/relay/README.md`.
 
 `access_leases` (optional, default `false`) declares that the relay installs
 broker-issued per-client credentials through the [relay lease
@@ -598,6 +738,52 @@ echoes the recorded value as `access_leases` (absent when `false`); a relay
 starts its lease syncer only when the echo is present, so a broker that
 predates leases leaves the relay serving the shared credential alone. The
 capability is private registration state and never appears in relay lists.
+
+### Inbound reachability probe
+
+A direct-transport relay registers and heartbeats over connections it opens
+itself, which proves nothing about whether its advertised
+`public_host:public_port` accepts connections. The broker therefore dials that
+endpoint itself (a bounded plain TCP connect, no Reality handshake) in the
+registration request, before anything is stored. The relay listens before it
+registers, so a failed connect means the endpoint is not accepting connections
+from the broker's network, and the registration is **refused**: `422` with
+the body
+`{"error": "public endpoint unreachable: the broker could not connect to <host>:<port>; ..."}`.
+Nothing is stored and no `Retry-After` is sent: the relay's own registration
+retries (seconds apart at startup, then rounds backed off to a minute) re-run
+the probe, so the relay admits itself as soon as the port opens and logs the
+refusal within seconds of starting; and `deploy/relay/volunteer-up.sh` reads that log line to tell the
+operator which firewall to open. The leading phrase `public endpoint
+unreachable` is therefore a contract. A successful probe registers the relay
+and reports `"reachable": true` in the response (absent when the broker did
+not probe).
+
+Heartbeats re-probe once the stored result is older than the probe interval,
+so a relay that registered reachable and then went dark is **withheld from
+[`GET /api/v1/relays`](#list-relays) and [`POST
+/api/v1/access`](#client-access)** until a later probe succeeds; it stays
+registered, heartbeats and syncs leases normally, and the operator views show
+the result (see [inventory](#operational-relay-inventory)). A repaired relay
+is relisted without re-registering. Only direct transport is probed; a tunnel relay's advertised
+endpoint is the relay hub. A probe the broker could not attempt — no route or
+local address for the endpoint's address family, a transient resolver
+failure — is inconclusive and changes nothing.
+
+The broker dials only endpoints a client on the public internet could reach
+itself: the host is resolved first, and an address that is loopback, private,
+link-local, carrier-grade NAT, multicast, documentation or otherwise
+non-routable space — or one of the broker host's own — is never dialled. Such
+a registration is inconclusive (unprobed and listed, as before), so
+registering an endpoint can never reveal whether a port on or near the broker
+accepts connections.
+
+`OPENRUNG_RELAY_PROBE` switches the probe `off` (default `on`);
+`OPENRUNG_RELAY_PROBE_TIMEOUT` bounds one dial (default `5s`) and
+`OPENRUNG_RELAY_PROBE_INTERVAL` is how old a result may be before a heartbeat
+re-probes (default `5m`). With the probe off every relay is listed on its
+lease alone: results a previous run stored are ignored (they still show in
+the inventory), so switching it off relists every withheld relay at once.
 
 `relay_version` identifies the relay runtime artifact, independently of the
 broker, relay hub, and client app versions. Standalone images report values such
@@ -885,6 +1071,11 @@ through a pre-`node_class` broker binary) or interfering with a foundation
 relay: a refused heartbeat changes nothing, and an unattended foundation row
 expires from the origin store within one lease TTL.
 
+A heartbeat also re-runs the [inbound reachability
+probe](#inbound-reachability-probe) of a direct relay's endpoint once the
+stored result is older than `OPENRUNG_RELAY_PROBE_INTERVAL`; the heartbeat
+response is unaffected, but the outcome decides whether the relay is listed.
+
 An identity-bearing registration also requires its current `lease_token` on
 heartbeat. The broker rotates this opaque token on every successful
 registration and returns `404 relay not found` for a missing or superseded
@@ -1012,11 +1203,21 @@ limiter and exists when `OPENRUNG_API_TOKEN` is configured.
 GET /api/v1/relays?limit=5
 ```
 
-The order of `relays` is the broker's candidate ranking. The broker uses recent
+The order of `relays` is the broker's candidate ranking. A direct relay whose
+latest [inbound reachability probe](#inbound-reachability-probe) failed is
+left out before ranking and page shaping. The broker uses recent
 connection successes/failures, active sessions, observed client latency, and
 speed-test telemetry. The latency it scores is aggregated across all clients,
-so it cannot describe any one client's path. IPv6 is only a final tie-breaker
-after score and heartbeat recency. `limit` truncates *after* ranking, so
+so it cannot describe any one client's path. The order is drawn per response by
+weighted random sampling without replacement, with each relay's weight rising
+steeply with its score: a clearly better relay leads almost every response,
+while relays with similar scores take turns at the head, so concurrent clients
+spread across them rather than all landing on the marginal leader. IPv6 is only
+a final tie-breaker after the sampled order and heartbeat recency. `limit`
+defaults to `OPENRUNG_RELAY_LIST_DEFAULT_LIMIT` and may not exceed
+`OPENRUNG_RELAY_LIST_MAX_LIMIT` (larger values are `400`); the operator keeps
+the maximum at or above every shipped client's request. `limit`
+truncates *after* ranking, so
 membership of the returned set — unlike the order within it — is decided
 entirely by the broker.
 
@@ -1197,7 +1398,9 @@ once, and clients re-authenticate.
 | `400` | Malformed body, unknown field, unparseable or non-P-256 key, invalid challenge text |
 | `401` | `challenge unknown or expired`, or `invalid signature` |
 | `403` | The user is disabled; the body carries `user_id` and `status` but no token |
+| `403` + `"code": "datacenter_source"` | A new identity from a datacenter or hosting network (see below); nothing was stored or charged |
 | `429` | Enrollment budget exhausted for this source; `Retry-After` says when the window resets |
+| `503` + `"code": "source_unclassified"` + `Retry-After` | A new identity could not be classified because the broker's classification data is missing or stale; retry later |
 | `503` | Store unavailable |
 
 **Enrollment budget.** Only a *new* identity is charged, after its signature
@@ -1207,6 +1410,31 @@ verifies, against two fixed windows per source (the IPv4 address, or the IPv6
 attempt is never charged, and existing keys authenticate freely. A negative
 limit disables that window. Clients behind one shared address share a budget,
 so a client should surface the `Retry-After` rather than retry immediately.
+
+**Datacenter sources.** When the operator configures source classification
+(`OPENRUNG_SOURCE_ASN_DB` and `OPENRUNG_DATACENTER_ASN_LIST`, see
+`deploy/broker/README.md`), a *new* identity whose source address lies in a
+range announced by a listed datacenter or hosting ASN is refused before the
+enrollment budget is consulted:
+
+```json
+{"error": "enrollment is not available from this network", "code": "datacenter_source"}
+```
+
+The classification is a lookup in local files the operator refreshes; no
+request leaves the broker. Addresses the data does not cover are not
+datacenter sources, and `OPENRUNG_ENROLLMENT_EXEMPT_CIDRS` are never refused.
+An existing key authenticates from any network, so an installation enrolled
+once keeps working through another VPN or a hosting provider. While the data
+is missing or older than `OPENRUNG_SOURCE_ASN_MAX_AGE` (default 7 days), a new
+identity receives `503` with `Retry-After: 300` and the code
+`source_unclassified` instead of being admitted or refused on stale
+information. Without the two files configured nothing changes. The `code`
+field is the machine-readable part of these bodies: clients should map it to
+their own explanation (connectcore raises the `enrollment_refused` notice and
+records the `enrollment_refused` access outcome) rather than show the
+`error` text. The broker counts both refusals in its ten-minute access
+summary line and logs nothing about the individual request.
 
 Later authentication of an existing key only updates its `last_auth_at`;
 nothing else about the record changes, and a disabled identity stays disabled.
@@ -1240,6 +1468,145 @@ The reason is at most 256 characters of printable text. Every change is
 logged with the caller's IP. Unknown or malformed IDs are `404`; the routes
 share the operational API's limiter and exist only when both
 `OPENRUNG_API_TOKEN` and `OPENRUNG_USER_TOKEN_KEY` are configured.
+
+```http
+GET /admin/api/users?status=disabled&sort=leases_24h&offset=0&limit=50
+Authorization: Bearer <OPENRUNG_API_TOKEN>
+```
+
+Lists users one page at a time. `status` (`enabled` or `disabled`) filters;
+`sort` is `last_auth` (default: most recently authenticated first),
+`leases_24h` (most leases issued in the last 24 hours first) or `enrolled`
+(newest first), with the user ID as the final tiebreak; `limit` is 1–100
+(default 50) and `offset` is zero or more. Invalid parameters are `400`.
+Each row is the operator view above plus three counters derived from access
+leases — the broker keeps no per-user traffic volume, so lease activity is the
+only volume signal:
+
+```json
+{
+  "generated_at": "2026-10-16T16:00:00Z",
+  "sort": "leases_24h",
+  "total": 1,
+  "offset": 0,
+  "limit": 50,
+  "users": [
+    {
+      "user_id": "user_0123456789abcdef0123456789abcdef",
+      "status": "enabled",
+      "created_at": "2026-10-16T12:00:00Z",
+      "last_auth_at": "2026-10-16T15:55:00Z",
+      "live_leases": 2,
+      "leases_issued_24h": 6,
+      "relays_24h": 3
+    }
+  ]
+}
+```
+
+`live_leases` counts leases neither revoked nor expired, `leases_issued_24h`
+counts leases created in the last 24 hours (a renewal extends a lease rather
+than issuing one), and `relays_24h` counts distinct relays among leases
+issued or renewed in the last 24 hours. `total` counts every user matching the
+filter. The route shares the limiter and the configuration requirements above.
+
+## Client access
+
+```http
+POST /api/v1/access
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{"limit": 5, "relay_id": "relay_0123456789abcdef0123456789abcdef"}
+```
+
+An authenticated user asks for relays to connect to and receives one
+per-user VLESS credential (an access lease) on each. The body is exactly one
+JSON object with no unknown fields: `limit` (1–5, default 5), and at most one
+target — `relay_id` (one exact relay) or `country` (a two-letter code, matched
+case-insensitively against `country_code`). No target asks for the
+best-ranked relays.
+
+The broker ranks relays exactly as for `GET /api/v1/relays`, keeps only relays
+that can install per-user credentials (identity-bearing, lease-capable,
+direct-transport registrations whose latest [inbound reachability
+probe](#inbound-reachability-probe) did not fail), narrows them to the target, reserves the WSS
+slot like the public list, and then issues or extends one lease per relay. It
+waits up to five seconds for each relay to acknowledge the lease through its
+[lease sync](#relay-lease-sync) and answers with the relays that did.
+
+**Acknowledgement.** The answer is whatever subset acknowledged in time: a
+relay that stays silent beside one that acknowledged is simply left out. When
+no relay acknowledged, the broker re-reads the relays it is waiting for. One
+whose last heartbeat is still within the relay heartbeat interval is alive and
+merely slow, so the wait runs once more (one extension; a request therefore
+takes at most ten seconds). A relay that has missed a heartbeat is treated as
+gone and the answer is `503` at once, so the client's retry or fallback is not
+delayed by a relay that will never install the lease. A relay that has left
+the directory altogether is not a candidate at all: a request naming it as
+`relay_id` gets `200` with an empty list (nothing is issued).
+
+**Empty answers.** `200` with `"relays": []` means no lease-capable relay
+matches the request right now. Clients treat it by context: at connect time
+the shared public list is used instead (until enforcement), and at renewal
+time it means the connected relay is gone, so the client reconnects through
+its ladder immediately rather than retrying a dead relay until the lease
+expires. The broker logs one `INFO` summary of access answers per ten-minute
+window (counts by outcome: granted, empty, unapplied, extended, denied,
+unauthorized, rate limited, malformed, cancelled, errors; plus the user
+authentications that refused a new identity from a datacenter source or for
+want of classification data), so access health
+remains readable from the broker log after the origin access log has rolled
+over; a request its client abandoned mid-flight is logged at `INFO`, never as
+an error.
+
+Success is `200 OK`, signed exactly like a relay list (same key, same
+`X-OpenRung-Relays-Signature` header, same wire schema) but on the `access`
+channel, without `limit`, and with the lease expiry:
+
+```json
+{
+  "count": 1,
+  "server_time": "2026-10-17T12:00:00Z",
+  "not_after": "2026-10-17T12:30:00Z",
+  "key_id": "<key id>",
+  "channel": "access",
+  "lease_expires_at": "2026-10-17T13:00:00Z",
+  "relays": [{ "id": "relay_…", "client_id": "<this user's lease credential>", "…": "…" }]
+}
+```
+
+Each descriptor's `client_id` is the caller's credential for that relay; it
+stops being accepted at `lease_expires_at` (compare with `server_time`, not the
+local clock). For a relay that registered an `access_host`, and only when the
+access request itself arrived over IPv6 (as seen by the broker, through a
+trusted front the viewer's address), the descriptor's `public_host` is that
+access address instead of the address the public relay list carries. A request
+over IPv4 gets the public host. Every other field is the relay's public
+descriptor either way. Clients must verify the signature and require
+`channel == "access"`; a public list never verifies here and an access body
+never verifies as a public list.
+
+**Renewal.** A connected client repeats the request with the connected relay
+as `relay_id` well before expiry (about half-way). The broker extends the
+existing lease and returns the same `client_id` with a later
+`lease_expires_at`, so a running tunnel never needs a new credential.
+
+| Status | Meaning |
+| --- | --- |
+| `200` with `"relays": []` | No relay matches the target — including a `relay_id` that has expired from the directory — or every match is at its lease capacity; nothing was issued |
+| `400` | Malformed body, unknown field, `limit` out of range, both targets, invalid country |
+| `401` | Missing, invalid or expired access token, or an unknown user: authenticate again |
+| `403` | The user is disabled |
+| `429` | Rate limit (per client address and user) |
+| `503` + `Retry-After: 2` | Leases were issued but no relay acknowledged them in time (after one extended wait if a relay was still heartbeating); the retry returns the same credentials |
+
+Access requests carry no telemetry identifiers, never follow redirects, and are
+refused by clients on endpoint-unbound fronts (the Azure no-SNI mode); the
+route exists only when `OPENRUNG_USER_TOKEN_KEY` is configured and the store
+holds leases. Each user holds at most `OPENRUNG_MAX_LEASES_PER_USER` live
+leases; past it the least recently renewed leases outside the request are
+revoked first.
 
 ## Issue WSS Session Ticket
 

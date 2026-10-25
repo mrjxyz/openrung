@@ -99,7 +99,7 @@ interfaces remain in their owning applications.
   user traffic.
 - 🗄️ **Production-friendly broker** — optional shared PostgreSQL state for safe
   restarts and load-balanced deployments.
-- 📊 **Operational visibility** — colored per-connection logs for relay
+- 📊 **Operational visibility** — opt-in colored per-connection logs for relay
   operators and an opt-in, token-protected telemetry dashboard.
 
 ## Quick start
@@ -127,13 +127,35 @@ and `-`; at most 63 characters), pass `OPENRUNG_LABEL` through `sudo`:
 curl -fsSL https://raw.githubusercontent.com/openrung/openrung/main/deploy/relay/volunteer-up.sh | sudo env OPENRUNG_LABEL=my-relay sh
 ```
 
+On the first run the script asks one optional question on your terminal: a
+contact email for the relay. It is used only to reach you if there is an issue
+with your relay, is sent privately to the broker, and is never published in the
+relay directory. Press Enter to skip; if the script found a likely address (your
+git email), it shows it in brackets and Enter accepts it. To answer in advance,
+pass `OPENRUNG_OPERATOR_CONTACT=you@example.org` (or an empty value to skip)
+through `sudo env` like the name above. Without a terminal, such as under
+cloud-init, nothing is asked.
+
 Once `/etc/openrung/relay.env` exists, it is authoritative. Edit that file and
-re-run the installer to change an existing relay's name or other settings.
+re-run the installer to change an existing relay's name, contact, or other
+settings.
+
+The script opens TCP 443 in the host firewall (ufw or firewalld) itself. The
+broker connects to that port from the internet before it accepts a relay, so
+the script then reads from the relay's log whether the registration was
+accepted or refused. A refusal means the port is blocked outside the VM — your
+provider's firewall or security group, which nothing inside the VM can change
+— so the script prints where to open it for your provider (AWS, Hetzner,
+Google Cloud, Azure, Oracle, DigitalOcean, Vultr, Alibaba, Tencent, or
+generic instructions) and keeps checking for up to ten minutes while you do.
+The relay is installed either way and registers by itself once the port
+opens.
 
 Afterwards:
 
-- **Allow inbound TCP 443** in your provider's firewall (and
-  `sudo ufw allow 443/tcp` if you use ufw) so clients can reach the relay.
+- **Check later** with `docker logs openrung-relay 2>&1 | grep -E 'registered
+  relay|public endpoint'`: the relay retries registration about every minute
+  until the broker can reach it.
 - **Update** by re-running the same command — your relay keeps its identity,
   and a failed update rolls back to the running version automatically.
 - **Watch it**: `docker logs -f openrung-relay`
@@ -200,7 +222,7 @@ Relay ranking uses recent connection telemetry, capacity, and operator-set
 weights, with heartbeat recency and IPv6 used as tie-breakers.
 
 To enable the protected telemetry dashboard, set a separate administrator token
-before starting the broker, then open `/admin/telemetry`:
+before starting the broker, then open `/admin/dashboard`:
 
 ```sh
 OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION=true \
@@ -227,16 +249,18 @@ go run ./cmd/relay \
 
 Useful to know:
 
-- With connection logging enabled (the default), `-listen-host ::` opens both
-  the IPv6 and IPv4 wildcard listeners. When `-public-host` is omitted, the
+- `-listen-host ::` (the default) serves both IPv6 and IPv4: Xray binds one
+  dual-stack wildcard socket. When `-public-host` is omitted, the
   relay advertises the first global IPv6 address it finds. Set `-public-host`
   to advertise a DNS name, IPv4 address, or specific IPv6 address, and set
   `-listen-host` when the local bind address should differ.
 - A global IPv6 address still needs inbound firewall/router rules that allow
   clients to reach the relay port.
-- Client connection events print in color by default — green on open, red on
-  close, with client IP, duration, and byte counts. Pass
-  `-connection-log=false` to let Xray bind the public port directly.
+- Xray binds the public port directly by default. Pass `-connection-log` to
+  print client connection events in color — green on open, red on close, with
+  client IP, duration, and byte counts. The log puts a counting TCP proxy in
+  front of Xray, which costs CPU per byte; with it, `-listen-host ::` opens
+  separate IPv6 and IPv4 listeners.
 - The broker currently advertises one `public_host` per relay. For both
   IPv4 and IPv6 discovery, advertise a DNS name with A and AAAA records, or
   run separate registrations.

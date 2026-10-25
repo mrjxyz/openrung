@@ -84,6 +84,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Datacenter source classification of new user identities: off unless
+	// the operator points it at the refreshed data files.
+	sourceClassifier, err := newSourceClassifier()
+	if err != nil {
+		return err
+	}
 	if *printWSSTicketPublicKey {
 		if len(wssTicketSeed) == 0 {
 			return errors.New("OPENRUNG_WSS_TICKET_SIGNING_SEED is required")
@@ -139,6 +145,20 @@ func run() error {
 		return err
 	}
 	geoResolver := newGeoIPResolver(*geoIPEndpoint)
+	// Inbound reachability probe of direct relays' advertised endpoints: on
+	// by default; empty durations apply broker.Config's built-in defaults.
+	relayProbeTimeout, err := parseOptionalDuration("OPENRUNG_RELAY_PROBE_TIMEOUT")
+	if err != nil {
+		return err
+	}
+	relayProbeInterval, err := parseOptionalDuration("OPENRUNG_RELAY_PROBE_INTERVAL")
+	if err != nil {
+		return err
+	}
+	relayProber, err := newRelayProber(os.Getenv("OPENRUNG_RELAY_PROBE"), relayProbeTimeout, relayProbeInterval)
+	if err != nil {
+		return err
+	}
 	store, err := newRelayStore(*relayStore, *relayDatabaseURL)
 	if err != nil {
 		return err
@@ -157,6 +177,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	rateLimits, err := parseRateLimits()
+	if err != nil {
+		return err
+	}
+	relayListDefaultLimit, relayListMaxLimit, err := parseRelayListLimits()
+	if err != nil {
+		return err
+	}
+	wssTicketTTL, wssTicketMaxStreams, err := parseWSSTicketBounds()
+	if err != nil {
+		return err
+	}
 
 	cfg := broker.Config{
 		RegistrationToken: registrationToken,
@@ -164,20 +196,30 @@ func run() error {
 		RelayLeaseTTL:     *leaseTTL,
 		TelemetrySink:     telemetrySink,
 		DashboardToken:    dashboardToken,
+		Version:           buildinfo.Version(baseVersion),
+		Revision:          buildinfo.Revision(),
 		APIToken:          apiToken,
 		// The only proxies trusted for forwarded client IPs; empty trusts none (prod: loopback Caddy).
 		TrustedProxyCIDRs:          splitAndTrim(os.Getenv("OPENRUNG_TRUSTED_PROXY_CIDRS")),
 		MaxNewRelayIDsPerIPPerDay:  maxNewRelayIDs,
 		RegistrationCapExemptCIDRs: splitAndTrim(os.Getenv("OPENRUNG_REGISTRATION_CAP_EXEMPT_CIDRS")),
 		GeoIP:                      geoResolver,
+		RelayProber:                relayProber,
+		RelayProbeInterval:         relayProbeInterval,
 		SigningSeed:                signingSeed,
 		WSSTicketSigningSeed:       wssTicketSeed,
+		WSSTicketTTL:               wssTicketTTL,
+		WSSTicketMaxStreams:        wssTicketMaxStreams,
+		RateLimits:                 rateLimits,
+		RelayListDefaultLimit:      relayListDefaultLimit,
+		RelayListMaxLimit:          relayListMaxLimit,
 		UserTokenKey:               userTokenKey,
 		AccessTokenTTL:             accessTokenTTL,
 		EnrollmentBudget:           broker.EnrollmentBudget{BurstLimit: enrollmentBurstLimit, DailyLimit: enrollmentDailyLimit},
 		AccessLeaseTTL:             accessLeaseTTL,
 		MaxLeasesPerUser:           maxLeasesPerUser,
 		MaxLeasesPerRelay:          maxLeasesPerRelay,
+		SourceClassifier:           sourceClassifier,
 	}
 	if len(userTokenKey) > 0 {
 		slog.Info("client user authentication enabled")
@@ -212,6 +254,9 @@ func run() error {
 	}
 	shutdownContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	if sourceClassifier != nil {
+		go sourceClassifier.Run(shutdownContext, 0)
+	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		<-shutdownContext.Done()
@@ -224,7 +269,7 @@ func run() error {
 		close(shutdownDone)
 	}()
 
-	slog.Info("starting broker", "version", buildinfo.Version(baseVersion), "revision", buildinfo.Revision(), "addr", *addr, "lease_ttl", leaseTTL.String(), "telemetry_store", *telemetryStore, "telemetry_file", *telemetryFile, "relay_store", *relayStore, "dashboard_enabled", dashboardToken != "", "operational_api_enabled", apiToken != "", "foundation_registration_enabled", foundationToken != "", "wss_ticket_issuance_enabled", len(wssTicketSeed) != 0, "status_interval", statusInterval.String(), "geoip_enabled", geoResolver != nil)
+	slog.Info("starting broker", "version", buildinfo.Version(baseVersion), "revision", buildinfo.Revision(), "addr", *addr, "lease_ttl", leaseTTL.String(), "telemetry_store", *telemetryStore, "telemetry_file", *telemetryFile, "relay_store", *relayStore, "dashboard_enabled", dashboardToken != "", "operational_api_enabled", apiToken != "", "foundation_registration_enabled", foundationToken != "", "wss_ticket_issuance_enabled", len(wssTicketSeed) != 0, "status_interval", statusInterval.String(), "geoip_enabled", geoResolver != nil, "relay_probe_enabled", relayProber != nil, "source_classification_enabled", sourceClassifier != nil)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		<-shutdownDone
@@ -286,6 +331,118 @@ func newGeoIPResolver(endpoint string) broker.GeoIPResolver {
 	default:
 		return broker.NewHTTPGeoIPResolver(endpoint)
 	}
+}
+
+// newRelayProber builds the inbound reachability prober from
+// OPENRUNG_RELAY_PROBE, or nil (probing disabled, every relay listed on its
+// lease alone) for an "off"-style mode. Zero durations mean the built-in
+// defaults; anything else malformed refuses to start rather than silently
+// running without the check or with a nonsensical bound.
+func newRelayProber(mode string, timeout, interval time.Duration) (broker.RelayProber, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "off", "disabled", "none", "false", "0":
+		return nil, nil
+	case "", "on", "enabled", "true", "1":
+	default:
+		return nil, errors.New("OPENRUNG_RELAY_PROBE must be on or off")
+	}
+	if timeout < 0 {
+		return nil, errors.New("OPENRUNG_RELAY_PROBE_TIMEOUT must be a positive duration like 5s")
+	}
+	if interval < 0 {
+		return nil, errors.New("OPENRUNG_RELAY_PROBE_INTERVAL must be a positive duration like 5m")
+	}
+	return broker.NewTCPRelayProber(timeout), nil
+}
+
+// newSourceClassifier builds the datacenter source classifier from
+// OPENRUNG_SOURCE_ASN_DB and OPENRUNG_DATACENTER_ASN_LIST, or returns nil
+// (classification disabled) when neither is set. Setting only one, a
+// malformed exempt CIDR or max age refuses to start; data that cannot be
+// loaded yet does not (enrollment answers 503 until it can).
+func newSourceClassifier() (*broker.SourceClassifier, error) {
+	table := strings.TrimSpace(os.Getenv("OPENRUNG_SOURCE_ASN_DB"))
+	list := strings.TrimSpace(os.Getenv("OPENRUNG_DATACENTER_ASN_LIST"))
+	if table == "" && list == "" {
+		if strings.TrimSpace(os.Getenv("OPENRUNG_ENROLLMENT_EXEMPT_CIDRS")) != "" {
+			slog.Warn("OPENRUNG_ENROLLMENT_EXEMPT_CIDRS is set but datacenter source classification is disabled (OPENRUNG_SOURCE_ASN_DB unset)")
+		}
+		return nil, nil
+	}
+	maxAge, err := parseOptionalDuration("OPENRUNG_SOURCE_ASN_MAX_AGE")
+	if err != nil {
+		return nil, err
+	}
+	return broker.NewSourceClassifier(broker.SourceClassifierConfig{
+		ASNDBPath:             table,
+		DatacenterASNListPath: list,
+		ExemptCIDRs:           splitAndTrim(os.Getenv("OPENRUNG_ENROLLMENT_EXEMPT_CIDRS")),
+		MaxAge:                maxAge,
+	})
+}
+
+// parseRateLimits reads the OPENRUNG_RATE_LIMIT_* per-client budgets
+// ("<per-second rate>:<burst>"); unset ones keep the broker's defaults.
+func parseRateLimits() (broker.RateLimits, error) {
+	var limits broker.RateLimits
+	for _, entry := range []struct {
+		name   string
+		target *broker.RateLimit
+	}{
+		{"OPENRUNG_RATE_LIMIT_RELAY_LIST", &limits.RelayList},
+		{"OPENRUNG_RATE_LIMIT_WSS_TICKET", &limits.WSSTicket},
+		{"OPENRUNG_RATE_LIMIT_TELEMETRY", &limits.Telemetry},
+		{"OPENRUNG_RATE_LIMIT_USER_AUTH", &limits.UserAuth},
+		{"OPENRUNG_RATE_LIMIT_ACCESS", &limits.Access},
+		{"OPENRUNG_RATE_LIMIT_RELAY_REGISTRATION", &limits.RelayRegistration},
+		{"OPENRUNG_RATE_LIMIT_SPEED_TEST", &limits.SpeedTest},
+	} {
+		limit, err := broker.ParseRateLimit(os.Getenv(entry.name))
+		if err != nil {
+			return broker.RateLimits{}, fmt.Errorf("%s: %w", entry.name, err)
+		}
+		*entry.target = limit
+	}
+	return limits, nil
+}
+
+// parseRelayListLimits reads the relay-list page sizes; zero keeps the
+// broker's default for that bound.
+func parseRelayListLimits() (defaultLimit, maxLimit int, err error) {
+	if defaultLimit, err = parseOptionalInt("OPENRUNG_RELAY_LIST_DEFAULT_LIMIT"); err != nil {
+		return 0, 0, err
+	}
+	if maxLimit, err = parseOptionalInt("OPENRUNG_RELAY_LIST_MAX_LIMIT"); err != nil {
+		return 0, 0, err
+	}
+	if defaultLimit < 0 || maxLimit < 0 {
+		return 0, 0, errors.New("OPENRUNG_RELAY_LIST_DEFAULT_LIMIT and OPENRUNG_RELAY_LIST_MAX_LIMIT must be positive")
+	}
+	if defaultLimit > 0 && maxLimit > 0 && defaultLimit > maxLimit {
+		return 0, 0, errors.New("OPENRUNG_RELAY_LIST_DEFAULT_LIMIT must not exceed OPENRUNG_RELAY_LIST_MAX_LIMIT")
+	}
+	return defaultLimit, maxLimit, nil
+}
+
+// parseWSSTicketBounds reads the per-ticket lifetime and stream budget; zero
+// keeps the broker's default. Out-of-range values fail startup here rather
+// than in the ticket issuer.
+func parseWSSTicketBounds() (time.Duration, int, error) {
+	ttl, err := parseOptionalDuration("OPENRUNG_WSS_TICKET_TTL")
+	if err != nil {
+		return 0, 0, err
+	}
+	if ttl != 0 && (ttl < 2*time.Second || ttl > wssbridge.MaxTicketLifetime) {
+		return 0, 0, fmt.Errorf("OPENRUNG_WSS_TICKET_TTL must be within [2s, %s]", wssbridge.MaxTicketLifetime)
+	}
+	streams, err := parseOptionalInt("OPENRUNG_WSS_TICKET_MAX_STREAMS")
+	if err != nil {
+		return 0, 0, err
+	}
+	if streams != 0 && (streams < 1 || streams > wssbridge.MaxTicketStreams) {
+		return 0, 0, fmt.Errorf("OPENRUNG_WSS_TICKET_MAX_STREAMS must be within [1, %d]", wssbridge.MaxTicketStreams)
+	}
+	return ttl, streams, nil
 }
 
 // parseNewRelayIDCap maps OPENRUNG_MAX_NEW_RELAY_IDS_PER_IP_PER_DAY onto

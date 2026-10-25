@@ -122,8 +122,15 @@ const (
 	// a superset of any client page — can never be replayed into a client's
 	// API slot, where the differing ordering and page contract would otherwise
 	// go unnoticed.
+	//
+	// ChannelAccess is the per-user answer of POST /api/v1/access: the same
+	// relay-list shape, but each descriptor's client_id is that user's
+	// broker-issued lease credential and the body carries lease_expires_at
+	// instead of an echoed limit. A distinct channel keeps a per-user body
+	// out of the public list slot and a public list out of the access slot.
 	ChannelAPI       = "api"
 	ChannelInventory = "inventory"
+	ChannelAccess    = "access"
 
 	// NodeClassFoundation marks a relay operated by the OpenRung Foundation
 	// itself; NodeClassVolunteer (the default) marks community-operated
@@ -263,9 +270,12 @@ type RelayListResponse struct {
 	Relays []RelayDescriptor `json:"relays"`
 }
 
-// ErrorResponse is the broker's JSON error body shape.
+// ErrorResponse is the broker's JSON error body shape. Code is a
+// machine-readable token on the answers that define one (for example
+// UserAuthCodeDatacenterSource); absent otherwise.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 // EffectiveNodeClass reads the class a client should act on from the value in

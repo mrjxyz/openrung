@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,6 +101,10 @@ type Config struct {
 	NodeClass string
 	// Label is the public relay name; generated (adjective-noun) when empty.
 	Label string
+	// OperatorContact is how the operator can be reached about this relay
+	// (typically an email address). Optional; sent at direct-mode
+	// registration and kept private by the broker.
+	OperatorContact string
 	// PublicHost is the public hostname or IP clients can reach (cmd/relay's
 	// -public-host). Direct mode uses it verbatim; when empty, the host's
 	// first global IPv6 address is auto-detected and periodically re-checked
@@ -108,6 +113,16 @@ type Config struct {
 	// comes from the hub. A WSS relay binds xray to the IPv4 wildcard, so it
 	// should set this to the IPv4 address the directory must advertise.
 	PublicHost string
+	// AccessHost is an optional IPv6 address, distinct from PublicHost, that
+	// a direct relay serves on its one public listener and advertises at
+	// registration as access_host (cmd/relay's -access-host, ADR-006.1 Part
+	// A): the broker may hand it to enrolled clients in place of PublicHost.
+	// The host must configure it (deploy/relay/foundation-up.sh does) as a
+	// deprecated address, so the relay's own traffic stays on the primary
+	// address; every registration first verifies that with a read-only
+	// netlink query and leaves the field out, with a log line, when the check
+	// fails. Direct mode only, with xray owning a wildcard listener.
+	AccessHost string
 	// PublicPort is the port a direct registration advertises (cmd/relay's
 	// -public-port). Zero means ListenPort, which is right whenever no port
 	// mapping sits in front of the relay. Auto mode ignores it: the probe
@@ -164,12 +179,21 @@ type Config struct {
 	// the public listener directly — no per-connection observer runs, so
 	// relay-local WSS streams produce no address or byte-count records.
 	WSSFronts []relay.WSSFrontDescriptor
+	// ObserveConnections puts the engine's ConnectionObserver, a TCP proxy, in
+	// front of xray in a direct session, so Status reports active connections,
+	// totals and bytes. It adds a loopback hop and per-byte copies, so server
+	// relays leave it off and xray owns the public port directly; Status then
+	// counts only tunnel streams. A non-nil ConnectionLogOutput implies it. WSS
+	// relays are never observed: validation rejects it together with
+	// WSSFronts.
+	ObserveConnections bool
 	// ConnectionLogOutput, when non-nil, receives the observer's colored
 	// per-connection connect/disconnect lines — which include client IPs — as
-	// cmd/relay prints to stdout. Nil (the default, and the GUI posture) keeps
-	// them out of every log; aggregate counters remain in Status either way.
-	// The engine serializes writes (one line per Write call), so the writer
-	// itself does not need to be goroutine-safe.
+	// cmd/relay prints to stdout, and implies ObserveConnections. Nil (the
+	// default, and the GUI posture) keeps them out of every log; an observed
+	// session still keeps aggregate counters in Status. The engine serializes
+	// writes (one line per Write call), so the writer itself does not need to
+	// be goroutine-safe.
 	ConnectionLogOutput io.Writer
 	// Identity seeds the relay identity; missing parts are generated.
 	Identity Identity
@@ -308,8 +332,8 @@ func (c Config) validateWSSFronts() error {
 	if !wssListenHostReachesIPv4Loopback(c.ListenHost) {
 		return errors.New("WSS fronts require an IPv4-loopback-reachable listen host: 0.0.0.0 (production) or 127.0.0.1 (testing)")
 	}
-	if c.ConnectionLogOutput != nil {
-		return errors.New("WSS fronts require connection logging disabled so relay-local WSS streams produce no per-connection address or byte-count records")
+	if c.observeConnections() {
+		return errors.New("WSS fronts require connection logging and connection observing disabled so relay-local WSS streams produce no per-connection address or byte-count records")
 	}
 	if strings.TrimSpace(c.Identity.IdentitySeed) == "" {
 		return errors.New("WSS fronts require an explicit stable identity seed")
@@ -423,6 +447,12 @@ func (c Config) validate() error {
 	if _, err := relay.NormalizeLabel(c.Label); err != nil {
 		return fmt.Errorf("invalid label: %w", err)
 	}
+	if _, err := relay.NormalizeOperatorContact(c.OperatorContact); err != nil {
+		return fmt.Errorf("invalid operator contact: %w", err)
+	}
+	if err := c.validateAccessHost(); err != nil {
+		return err
+	}
 	if c.Mode == ModeAuto {
 		for _, port := range c.AutomaticPortCandidates {
 			if port < 1 || port > 65535 {
@@ -440,6 +470,82 @@ func (c Config) validate() error {
 		return fmt.Errorf("heartbeat interval must be at least 5s")
 	}
 	return nil
+}
+
+// validateAccessHost enforces where an access address can be served: a
+// direct relay whose xray owns one wildcard listener. xray binds a wildcard
+// through Go's generic "tcp" network, which opens a single dual-stack socket,
+// so the IPv4 public endpoint and the IPv6 access address share it; a literal
+// listen host would serve only one of them, and the connection observer's
+// per-family listeners are not part of this posture.
+func (c Config) validateAccessHost() error {
+	if strings.TrimSpace(c.AccessHost) == "" {
+		return nil
+	}
+	access, err := relay.NormalizeAccessHost(c.AccessHost)
+	if err != nil {
+		return fmt.Errorf("invalid access host: %w", err)
+	}
+	if !c.resolvesToDirect() {
+		return errors.New("an access host requires direct mode")
+	}
+	if public, err := netip.ParseAddr(strings.TrimSpace(c.PublicHost)); err == nil && public.Unmap().String() == access {
+		return errors.New("the access host must differ from the public host")
+	}
+	if !accessHostListenHost(c.ListenHost) {
+		return errors.New("an access host requires a wildcard listen host (::, dual, both or 0.0.0.0) so one dual-stack listener serves both addresses")
+	}
+	if c.observeConnections() {
+		return errors.New("an access host requires connection logging and observing disabled, so xray owns the public listener")
+	}
+	return nil
+}
+
+// accessHostListenHost reports whether a listen host renders as the wildcard
+// xray binds dual-stack (see xrayPublicListenHost and wssListenHost).
+func accessHostListenHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "", "::", "dual", "both", "0.0.0.0":
+		return true
+	default:
+		return false
+	}
+}
+
+// verifiedAccessHost returns the access host to advertise in a registration
+// whose resolved public host is publicHost, or "" — with the reason logged —
+// when none is configured, it names the public host itself, or the host check
+// fails. It runs per registration, so an address configured after the relay
+// started is picked up by the next re-registration.
+func (e *Engine) verifiedAccessHost(cfg Config, publicHost string) string {
+	access, err := e.checkAccessHost(cfg, publicHost)
+	if err != nil {
+		e.logf("not advertising access host %s: %v", access, err)
+		return ""
+	}
+	return access
+}
+
+// checkAccessHost is verifiedAccessHost without the logging: it returns the
+// configured access host and, when it must not be advertised, why. A relay
+// without an access host returns "" and no error.
+func (e *Engine) checkAccessHost(cfg Config, publicHost string) (string, error) {
+	access, err := relay.NormalizeAccessHost(cfg.AccessHost)
+	if err != nil || access == "" {
+		return "", nil
+	}
+	if public, err := netip.ParseAddr(strings.TrimSpace(publicHost)); err == nil && public.Unmap().String() == access {
+		return access, errors.New("it is the public host this relay registers with")
+	}
+	list := e.hostAddresses
+	if list == nil {
+		list = relayruntime.HostIPv6Addresses
+	}
+	configured, err := list()
+	if err == nil {
+		err = relayruntime.VerifyAccessAddress(netip.MustParseAddr(access), configured)
+	}
+	return access, err
 }
 
 // Status is a UI-ready snapshot of the engine.
@@ -461,7 +567,10 @@ type Status struct {
 	// identity key, so re-registering after an expired lease returns the same
 	// one — which is why a caller that reports each registration must watch
 	// this rather than diffing RelayID.
-	Registrations     uint64 `json:"registrations"`
+	Registrations uint64 `json:"registrations"`
+	// The connection and byte counters cover tunnel streams and, only when
+	// Config.ObserveConnections is in effect, direct connections; an
+	// unobserved direct session's xray serves clients the engine never sees.
 	ActiveConnections int64  `json:"activeConnections"`
 	TotalConnections  uint64 `json:"totalConnections"`
 	// BytesFromClients/BytesToClients count relayed traffic in both directions
@@ -531,6 +640,9 @@ type Engine struct {
 	// substitute a recorder, which is also what lets a session with xray
 	// disabled rotate at all.
 	newXrayUsers func(cfg Config, apiAddr string) relayruntime.XrayUserManager
+	// hostAddresses lists the host's IPv6 addresses for the access-address
+	// check; nil means relayruntime.HostIPv6Addresses. Tests substitute a fake.
+	hostAddresses func() ([]relayruntime.HostAddress, error)
 }
 
 func New(cfg Config, events Events) *Engine {
@@ -743,12 +855,21 @@ var errReresolve = errors.New("auto mode re-resolved to a different transport")
 // detectPublicIPv6 is a package var so tests can stub public-IPv6 detection. It
 // is used for the direct-session public-address checks; auto mode never guesses
 // direct from it (see autoResolve).
+//
+// Its argument is the configured access host (or ""), which detection skips:
+// the access address sits on the same interface as the primary address but
+// must never be advertised as the public host.
 var detectPublicIPv6 = relayruntime.DefaultPublicIPv6Address
 
 // autoReprobeInterval is how often auto mode re-evaluates reachability while a
 // session runs, so it converges to the right transport after a change (hub
 // outage/recovery, a port opening). A var so tests can shorten it.
 var autoReprobeInterval = 3 * time.Minute
+
+// accessRecheckInterval is how often a relay with an access host re-checks
+// that the address is still configured (see runDirectSession). A var so
+// tests can shorten it.
+var accessRecheckInterval = 30 * time.Second
 
 const (
 	// Automatic probes use Go's generic TCP wildcard (":port"), which selects a
@@ -800,15 +921,28 @@ func (c Config) publicPort() int {
 	return c.ListenPort
 }
 
-// isDualListenHost reports whether host is one of the aliases the connection
-// listener expands into a separate IPv6 and IPv4 listener. Xray binds exactly
-// one address, so these never reach it.
-func isDualListenHost(host string) bool {
+// observeConnections reports whether a direct session puts the connection
+// observer in front of xray. A connection log needs the observer to exist, so
+// it implies observing.
+func (c Config) observeConnections() bool {
+	return c.ObserveConnections || c.ConnectionLogOutput != nil
+}
+
+// xrayPublicListenHost is where an unobserved direct session's xray binds the
+// public port. The connection observer expands "::", "dual" and "both" into
+// separate IPv6 and IPv4 listeners, but xray binds exactly one address, so
+// those aliases (and the empty automatic-probe wildcard) map to "0.0.0.0":
+// xray listens through Go's generic "tcp" network, where an unspecified
+// address opens one dual-stack socket and falls back to whichever family the
+// host has — the same strategy as the automatic probe's ":port". "::" would
+// behave the same except on a host with IPv6 disabled, where it fails to bind.
+// Any other host is a literal address and binds as given.
+func xrayPublicListenHost(host string) string {
 	switch strings.ToLower(strings.TrimSpace(host)) {
-	case "dual", "both":
-		return true
+	case "", "::", "dual", "both":
+		return "0.0.0.0"
 	default:
-		return false
+		return strings.TrimSpace(host)
 	}
 }
 
@@ -1124,16 +1258,18 @@ func (e *Engine) startXray(ctx context.Context, cfg Config, identity Identity, l
 // anything — the engine form of cmd/relay's -print-config-only. Missing
 // identity parts are generated (and reported through OnIdentity) exactly as a
 // real session would, so the rendered config matches a subsequent Start. Like
-// cmd/relay, it renders the canonical direct-form binding: a live direct
-// session actually rebinds xray to a reserved loopback port behind the
-// observer, which is resolved at runtime and not knowable at render time.
+// cmd/relay, it renders the canonical direct-form binding: the public port on
+// the host an unobserved session's xray binds (dual-family aliases map to one
+// wildcard, see xrayPublicListenHost). An observed session instead rebinds
+// xray to a reserved loopback port behind the observer, which is resolved at
+// runtime and not knowable at render time.
 // Tunnel mode renders a freshly reserved loopback binding for the same reason
 // cmd/relay does. The render always carries the static client and no
 // management inbound: a rotating session's credentials exist only at runtime.
 func (e *Engine) RenderXrayConfig() ([]byte, error) {
 	// Refuse while running. Identity forking is prevented structurally by
-	// prepareIdentity's serialization, but a live direct session binds xray to
-	// a runtime-reserved loopback port, so a mid-session render would describe
+	// prepareIdentity's serialization, but a live observed session binds xray
+	// to a runtime-reserved loopback port, so a mid-session render would describe
 	// a binding the running relay does not use; refusing keeps the method's
 	// "matches a subsequent Start" promise unambiguous.
 	if e.Running() {
@@ -1160,10 +1296,8 @@ func (e *Engine) RenderXrayConfig() ([]byte, error) {
 		listenHost, listenPort = host, port
 	case len(cfg.WSSFronts) > 0:
 		listenHost = cfg.wssListenHost()
-	case isDualListenHost(listenHost):
-		// The dual-family aliases name two listeners, which only the connection
-		// listener can open; xray binds exactly one address.
-		return nil, fmt.Errorf("cannot render an xray config for listen host %q: it names two listeners", cfg.ListenHost)
+	default:
+		listenHost = xrayPublicListenHost(listenHost)
 	}
 	return relayruntime.BuildXrayConfig(relayruntime.XrayConfigInput{
 		ListenHost:        listenHost,
@@ -1187,7 +1321,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 		usedConfiguredHost = true
 	}
 	if publicHost == "" {
-		detected, err := detectPublicIPv6()
+		detected, err := detectPublicIPv6(cfg.AccessHost)
 		if err != nil {
 			return fmt.Errorf("this computer has no public address the internet can reach (no global IPv6): %w", err)
 		}
@@ -1195,15 +1329,17 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 	}
 
 	wss := len(cfg.WSSFronts) > 0
+	observe := !wss && cfg.observeConnections()
 	var xrayListenHost string
 	var xrayListenPort int
-	if wss {
+	switch {
+	case wss:
 		// WSS relays bypass the per-connection observer entirely (mirroring
 		// cmd/relay): opaque fallback streams must never create address or
 		// byte-count records, so xray owns the public listener directly and the
 		// engine's per-connection counters stay at zero.
 		xrayListenHost, xrayListenPort = cfg.wssListenHost(), cfg.ListenPort
-	} else {
+	case observe:
 		// The observer owns the public port and forwards to xray on loopback; it
 		// is also the traffic-counter source.
 		targetHost, targetPort, err := relayruntime.ReserveLoopbackTCPPort()
@@ -1211,6 +1347,9 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 			return err
 		}
 		xrayListenHost, xrayListenPort = targetHost, targetPort
+	default:
+		// Unobserved: xray owns the public port itself, with no proxy hop.
+		xrayListenHost, xrayListenPort = xrayPublicListenHost(listenHost), cfg.ListenPort
 	}
 
 	// Rotating credentials need xray's management inbound; a static session
@@ -1261,7 +1400,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 	}
 
 	var observerErr <-chan error
-	if !wss {
+	if observe {
 		// Per-connection lines include client IPs; unless the caller opted into
 		// console connection logging (ConnectionLogOutput) they go nowhere, and
 		// the engine surfaces aggregate counters instead. The observer writes
@@ -1296,6 +1435,8 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 			return fmt.Errorf("listen on port %d: %w", cfg.ListenPort, err)
 		}
 		e.logf("listening for direct connections on TCP %d", cfg.ListenPort)
+	} else {
+		e.logf("xray is listening for direct connections on TCP %d", cfg.ListenPort)
 	}
 
 	e.setStatus(func() { e.phase = PhaseRegistering })
@@ -1327,6 +1468,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 		MaxMbps:          cfg.MaxMbps,
 		RelayVersion:     cfg.Version,
 		Label:            label,
+		OperatorContact:  strings.TrimSpace(cfg.OperatorContact),
 		NodeClass:        cfg.NodeClass,
 		Transport:        relay.TransportDirect,
 		WSSFronts:        slices.Clone(cfg.WSSFronts),
@@ -1340,6 +1482,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 	// with the same expiry, binding the exact front list to this identity.
 	signedReq := func() (relay.RegisterRequest, error) {
 		signed := req
+		signed.AccessHost = e.verifiedAccessHost(cfg, signed.PublicHost)
 		expiresAt := time.Now().Add(relay.IdentityProofTTLDirect)
 		signed.IdentityPublicKey, signed.IdentityProof, signed.IdentityExpiresAt =
 			relay.SignIdentity(identityKey, signed, expiresAt)
@@ -1364,6 +1507,8 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 	if err := verifyRegisteredDescriptor(signed, desc, identityKey); err != nil {
 		return err
 	}
+	// The access host the broker currently holds for this registration.
+	registeredAccess := signed.AccessHost
 	e.logf("registered with the broker as %q (%s) at %s", desc.Label, desc.ID,
 		net.JoinHostPort(desc.PublicHost, strconv.Itoa(desc.PublicPort)))
 	if credentials != nil {
@@ -1462,10 +1607,81 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 	// arms when the registered address actually came from detection.
 	ipBaseline := ""
 	if !usedConfiguredHost {
-		ipBaseline, _ = detectPublicIPv6()
+		ipBaseline, _ = detectPublicIPv6(cfg.AccessHost)
 	}
 	ipRecheck := time.NewTicker(ipRecheckInterval)
 	defer ipRecheck.Stop()
+
+	// reRegister replaces this session's registration in place — xray, the
+	// lease syncer and the heartbeat carry on — signing a fresh request, so
+	// the access host is re-verified too. what names the cause in the logs.
+	reRegister := func(now time.Time, what string) bool {
+		reSigned, signErr := signedReq()
+		if signErr != nil {
+			e.logf("%s failed: %v", what, signErr)
+			return false
+		}
+		updated, regErr := broker.Register(ctx, reSigned)
+		if regErr != nil {
+			e.logf("%s failed: %v", what, regErr)
+			return false
+		}
+		if verifyErr := verifyRegisteredDescriptor(reSigned, updated, identityKey); verifyErr != nil {
+			// Fail closed like the initial registration: the broker-side
+			// lease now exists in a state this relay refuses to serve in
+			// (unattested class, tampered fronts), so end the session and
+			// surface the error instead of staying online mislabeled and
+			// re-registering at heartbeat cadence forever.
+			reRegisterErr = fmt.Errorf("%s: %w", what, verifyErr)
+			return false
+		}
+		desc = updated
+		registeredAccess = reSigned.AccessHost
+		ensureLeaseSync(desc)
+		e.logf("re-registered with the broker as %q (%s)", desc.Label, desc.ID)
+		if credentials != nil {
+			credentials.confirm(now, desc.ClientID)
+		}
+		// The ID is derived from the identity key and so is unchanged
+		// here; the counter is what tells a caller this happened.
+		e.registrations.Add(1)
+		e.setStatus(func() { e.relayID = desc.ID })
+		return true
+	}
+
+	// The access address can disappear after registration (a network
+	// manager reconfiguring the interface drops addresses it does not own),
+	// and the broker would keep handing it out. Re-check it on a short
+	// cadence and re-register whenever the advertisable value changes, so a
+	// missing address is withdrawn within one interval and a restored one is
+	// advertised again. Only a relay configured with an access host checks.
+	var accessRecheckC <-chan time.Time
+	if strings.TrimSpace(cfg.AccessHost) != "" {
+		accessRecheck := time.NewTicker(accessRecheckInterval)
+		defer accessRecheck.Stop()
+		accessRecheckC = accessRecheck.C
+	}
+	recheckAccessHost := func() {
+		access, checkErr := e.checkAccessHost(cfg, req.PublicHost)
+		usable := ""
+		if checkErr == nil {
+			usable = access
+		}
+		if usable == registeredAccess {
+			return
+		}
+		if usable == "" {
+			e.logf("access host %s is no longer usable (%v); re-registering without it", access, checkErr)
+		} else {
+			e.logf("access host %s is usable again; re-registering with it", access)
+		}
+		at := time.Now()
+		if credentials != nil {
+			req.ClientID = credentials.announce(ctx, at)
+			defer credentials.retire(ctx, at)
+		}
+		reRegister(at, "re-register for the access host")
+	}
 
 	// One heartbeat, shared by the ticker and the rotation boundary. A rotating
 	// session announces the newest accepted credential, learns which one the
@@ -1496,35 +1712,7 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 		if clientID != "" {
 			req.ClientID = clientID
 		}
-		reSigned, signErr := signedReq()
-		if signErr != nil {
-			e.logf("re-register after expired lease failed: %v", signErr)
-			return
-		}
-		updated, regErr := broker.Register(ctx, reSigned)
-		if regErr != nil {
-			e.logf("re-register after expired lease failed: %v", regErr)
-			return
-		}
-		if verifyErr := verifyRegisteredDescriptor(reSigned, updated, identityKey); verifyErr != nil {
-			// Fail closed like the initial registration: the broker-side
-			// lease now exists in a state this relay refuses to serve in
-			// (unattested class, tampered fronts), so end the session and
-			// surface the error instead of staying online mislabeled and
-			// re-registering at heartbeat cadence forever.
-			reRegisterErr = fmt.Errorf("re-register after expired lease: %w", verifyErr)
-			return
-		}
-		desc = updated
-		ensureLeaseSync(desc)
-		e.logf("re-registered with the broker as %q (%s)", desc.Label, desc.ID)
-		if credentials != nil {
-			credentials.confirm(now, desc.ClientID)
-		}
-		// The ID is derived from the identity key and so is unchanged
-		// here; the counter is what tells a caller this happened.
-		e.registrations.Add(1)
-		e.setStatus(func() { e.relayID = desc.ID })
+		reRegister(now, "re-register after expired lease")
 	}
 
 	// The rotation timer fires at each bucket boundary and heartbeats at once,
@@ -1562,11 +1750,13 @@ func (e *Engine) runDirectSession(ctx context.Context, broker *relayruntime.Brok
 				return fmt.Errorf("connection listener stopped: %w", err)
 			}
 		case <-ipRecheck.C:
-			detected, err := detectPublicIPv6()
+			detected, err := detectPublicIPv6(cfg.AccessHost)
 			if err == nil && ipBaseline != "" && detected != ipBaseline {
 				e.logf("public IPv6 changed %s → %s; re-registering", ipBaseline, detected)
 				return errPublicIPChanged
 			}
+		case <-accessRecheckC:
+			recheckAccessHost()
 		case <-heartbeat.C:
 			sendHeartbeat()
 		}

@@ -99,14 +99,37 @@ func (r UserAuthResponse) GoString() string {
 	return r.String()
 }
 
+// Machine-readable codes of user authentication refusals (ErrorResponse.Code,
+// surfaced as UserAuthStatusError.Code).
+const (
+	// UserAuthCodeDatacenterSource (403): the broker does not enroll a NEW
+	// installation key from the request's source network (a datacenter or
+	// hosting network). An already enrolled key is never refused this way.
+	UserAuthCodeDatacenterSource = "datacenter_source"
+	// UserAuthCodeSourceUnclassified (503, with Retry-After): the broker
+	// could not classify the source network of a new key for want of fresh
+	// data; retry later.
+	UserAuthCodeSourceUnclassified = "source_unclassified"
+)
+
+// maxUserAuthErrorCodeBytes bounds the code read from an error body.
+const maxUserAuthErrorCodeBytes = 64
+
 // UserAuthStatusError deliberately omits the response body and any token.
-// RetryAfter is set from a 429 enrollment-budget answer.
+// RetryAfter is set from a 429 enrollment-budget or a 503 answer that sent
+// one; Code is the body's machine-readable code when it carried a
+// well-formed one (UserAuthCode*), so callers can tell refusals that share a
+// status apart — a 403 without a code is a disabled user.
 type UserAuthStatusError struct {
 	StatusCode int
 	RetryAfter time.Duration
+	Code       string
 }
 
 func (e *UserAuthStatusError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("broker user authentication failed with HTTP status %d (%s)", e.StatusCode, e.Code)
+	}
 	return fmt.Sprintf("broker user authentication failed with HTTP status %d", e.StatusCode)
 }
 
@@ -222,6 +245,43 @@ func SignUserAuth(priv *ecdsa.PrivateKey, challenge string) (UserAuthRequest, er
 		Challenge: challenge,
 		Signature: base64.StdEncoding.EncodeToString(raw[:]),
 	}, nil
+}
+
+// SignUserAuthWith builds the request body for a challenge when the private
+// key is held elsewhere (an OS keystore, a hardware-backed key): publicKeySPKI
+// is the key's DER SubjectPublicKeyInfo and sign returns the raw 64-byte r‖s
+// signature over the SHA-256 digest it is given. The signature is checked
+// against the public key before it is returned, so a host key that signs
+// wrongly fails here instead of as an opaque 401.
+func SignUserAuthWith(publicKeySPKI []byte, challenge string, sign func(digest []byte) ([]byte, error)) (UserAuthRequest, error) {
+	if sign == nil {
+		return UserAuthRequest{}, errors.New("user signing function is required")
+	}
+	if !ValidUserChallenge(challenge) {
+		return UserAuthRequest{}, errors.New("user challenge is empty, oversized, or not printable")
+	}
+	encodedKey := base64.StdEncoding.EncodeToString(publicKeySPKI)
+	pub, err := ParseUserPublicKey(encodedKey)
+	if err != nil {
+		return UserAuthRequest{}, err
+	}
+	canonical, err := CanonicalUserPublicKey(pub)
+	if err != nil {
+		return UserAuthRequest{}, err
+	}
+	digest := sha256.Sum256(UserAuthStatement(challenge, canonical))
+	raw, err := sign(digest[:])
+	if err != nil {
+		return UserAuthRequest{}, fmt.Errorf("sign user authentication: %w", err)
+	}
+	if len(raw) != userSignatureBytes {
+		return UserAuthRequest{}, fmt.Errorf("user signature must be %d raw r||s bytes, got %d", userSignatureBytes, len(raw))
+	}
+	signature := base64.StdEncoding.EncodeToString(raw)
+	if !VerifyUserAuth(pub, challenge, signature) {
+		return UserAuthRequest{}, errors.New("user signature does not verify under the installation public key")
+	}
+	return UserAuthRequest{PublicKey: encodedKey, Challenge: challenge, Signature: signature}, nil
 }
 
 // VerifyUserAuth checks a raw r‖s signature over the statement for challenge
@@ -350,10 +410,11 @@ func (c *Client) postUserAuth(ctx context.Context, endpoint string, payload []by
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, &UserAuthStatusError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			Code:       userAuthErrorCode(errorBody),
 		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUserAuthResponseBytes+1))
@@ -364,4 +425,24 @@ func (c *Client) postUserAuth(ctx context.Context, endpoint string, payload []by
 		return nil, fmt.Errorf("user authentication response exceeds %d bytes", maxUserAuthResponseBytes)
 	}
 	return body, nil
+}
+
+// userAuthErrorCode extracts ErrorResponse.Code from an error body when it is
+// a short lowercase token; anything else (no JSON, no code, a malformed one)
+// yields "". The human-readable message is deliberately not surfaced.
+func userAuthErrorCode(body []byte) string {
+	var response ErrorResponse
+	if json.Unmarshal(body, &response) != nil {
+		return ""
+	}
+	code := response.Code
+	if code == "" || len(code) > maxUserAuthErrorCodeBytes {
+		return ""
+	}
+	for _, c := range []byte(code) {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return ""
+		}
+	}
+	return code
 }

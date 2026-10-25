@@ -6,7 +6,9 @@ this repository — the mobile apps foremost — can pin and consume the same
 implementation the desktop app and terminal client run.
 
 The module root is the connection engine: the connect state machine, candidate
-ladder and client-side ranking, relay-local WSS front fallback, the punch
+ladder and client-side ranking, address-family fallback (a relay an access
+answer names by IPv6 is dialled at its public IPv4 endpoint when IPv6 is
+unavailable or does not answer, see `family.go`), relay-local WSS front fallback, the punch
 attempt policy, mid-session health monitoring and failover, the directory
 cache, and the internet/readiness probes. Its subpackages carry the rest of
 the client policy layer:
@@ -21,12 +23,14 @@ the client policy layer:
 - `proxyconfig` — the stable local proxy endpoint policy and the opt-in shell
   integration.
 - `contract` — the embedded cross-repo contract vectors (failure
-  classification, relay decoding, broker fronts) and their Go loaders; the
-  mobile repository vendors the JSON files under `contract/vectors/`.
+  classification, relay decoding, broker fronts, event sequences, access
+  outcome tokens) and their Go loaders; the mobile repository vendors the JSON
+  files under `contract/vectors/`.
 
 Everything platform-specific reaches the engine through narrow interfaces
-(`interfaces.go`): event sink, persistence, OS proxy control, elevation, and
-the NAT punch transport (`PunchEstablisher` — implemented in the root module's
+(`interfaces.go`): event sink, persistence, OS proxy control, elevation, the
+installation key that per-user relay access (`access.go`, ADR-006) signs with,
+and the NAT punch transport (`PunchEstablisher` — implemented in the root module's
 `internal/enginepunch` over the quic-go transport in `internal/punch`, which
 deliberately stays out of this module). Hosts report their application version
 either at link time (`-X …/connectcore/client.appVersion=…`, used by the

@@ -144,6 +144,29 @@ type connection struct {
 	// wins. Written in connectFlow and read in reladder; touched only by the
 	// runConnect goroutine, not protected by mu.
 	discoveryPrimary string
+	// accessFront is the broker front per-user access requests go to (the
+	// discovery race winner, pinned for recovery and renewal), with its Azure
+	// TLS mode; accessUnsupported records a broker without the access
+	// endpoints for the rest of the session; lease describes the credentials
+	// of the last fetch (zero when it came from the public list). All are
+	// touched only by the runConnect goroutine (see access.go).
+	accessFront       string
+	accessAzureSNI    bool
+	accessUnsupported bool
+	lease             accessLease
+	// accessOutcome is how the access path went for the latest fetch (an
+	// access_outcome token, see access_outcome.go); empty until the fetch
+	// decided it. Touched only by the runConnect goroutine.
+	accessOutcome string
+	// publicFallback is the public list the discovery race returned when
+	// per-user access then succeeded: the candidates tried after the leased
+	// ones fail (see runPublicFallback). Nil when no race ran.
+	publicFallback *discovery.Fetch
+	// publicEndpoints is each relay's public endpoint from the public lists
+	// this connection fetched, kept across recoveries: the fallback for a
+	// relay an access answer names by IPv6 (see family.go). Touched only by
+	// the runConnect goroutine.
+	publicEndpoints map[string]relayEndpoint
 	// handledNetEpoch is the network epoch the supervisor has accounted for.
 	// Touched only by the runConnect goroutine.
 	handledNetEpoch uint64
@@ -291,6 +314,13 @@ type Engine struct {
 	// disables persistence.
 	Persistence Persistence
 
+	// Key is the installation's identity key (ADR-006). With a key the engine
+	// asks the broker for per-user relay credentials before connecting and
+	// renews them while connected; without one (or against a broker that
+	// does not issue them) it uses the public relay list. Mobile hosts set
+	// MobileHost.Key instead.
+	Key InstallationKey
+
 	// OSProxy points the OS system proxy at the tunnel while connected. Nil
 	// behaves like an unsupported platform.
 	OSProxy OSProxy
@@ -422,6 +452,16 @@ type Engine struct {
 	protectorOverride wsscore.SocketProtector
 	dnsServers        []string
 
+	// accessMu guards the cached broker access token (see access.go). It is
+	// process-local on purpose: the token is a bearer credential and is never
+	// persisted; a restart authenticates again. accessTokenScope names the
+	// broker that issued it (see accessTokenScopeFor), and the token is only
+	// ever presented to that broker.
+	accessMu          sync.Mutex
+	accessToken       string
+	accessTokenExpiry time.Time
+	accessTokenScope  string
+
 	// proxyPortMu pins only a successfully resolved endpoint for this process.
 	// A transient resolution failure remains retryable on the next call.
 	// Persistence carries automatic selections across launches.
@@ -436,6 +476,7 @@ type Engine struct {
 	probeTunnel          func(ctx context.Context, proxyPort int) (int64, error)
 	healthProbe          func(ctx context.Context, proxyPort int) error
 	dialRelay            func(ctx context.Context, host string, port int) (int64, error)
+	ipv6Probe            func() ipv6State
 	fetchRelays          func(ctx context.Context, brokerURL string, limit int, clientID, sessionID string) (discovery.Fetch, error)
 	tunnelReady          func(ctx context.Context, proxyPort int) error
 	requestWSSTicket     func(ctx context.Context, brokerURL string, request brokerapi.WSSTicketRequest, clientID, sessionID string) (brokerapi.WSSTicketResponse, error)
@@ -451,6 +492,8 @@ type Engine struct {
 	networkRecoveryLimit time.Duration      // 0 means mobileNetworkRecoveryLimit
 	physicalLivenessURLs []string           // nil means the fixed neutral mobile endpoints (per-engine test seam)
 	tunnelReadyLimit     time.Duration      // 0 means TunnelReadyTimeout
+	leaseClock           func() time.Time   // nil means the wall clock (lease renewal and token expiry)
+	leaseTimer           func(time.Duration) <-chan time.Time
 }
 
 func (s *Engine) tunnelReadyProbe() func(context.Context, int) error {
@@ -840,6 +883,9 @@ func (s *Engine) connectFlow(ctx context.Context, conn *connection, brokerURL st
 		if ctx.Err() != nil {
 			return "", nil
 		}
+		if errors.Is(err, ErrAccessDisabled) {
+			return "access_denied", err
+		}
 		return "broker_fetch", err
 	}
 
@@ -847,6 +893,7 @@ func (s *Engine) connectFlow(ctx context.Context, conn *connection, brokerURL st
 	if err != nil {
 		return stage, err
 	}
+	cands = s.adaptToAddressFamily(conn, cands)
 	order := s.rankLadder(ctx, cands, target)
 	ladder := order.candidates()
 	s.mu.Lock()
@@ -872,6 +919,11 @@ func (s *Engine) connectFlow(ctx context.Context, conn *connection, brokerURL st
 	// not the client's; a result that already arrived is pre-tunnel and kept.
 	conn.geo.abandon()
 	res, err := s.runLadder(ctx, conn, ladder, port)
+	if err != nil {
+		if fallback, fallbackOrder, ok, fallbackErr := s.runPublicFallback(ctx, conn, brokerURL, target, ladder, port, "", err); ok {
+			res, order, err = fallback, fallbackOrder, fallbackErr
+		}
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", nil
@@ -901,13 +953,54 @@ func (s *Engine) fetchCandidates(ctx context.Context, conn *connection, brokerUR
 		limit = DirectoryRelayLimit
 	}
 	started := time.Now()
+	// Per-user access (access.go) goes to the front a discovery race already
+	// proved reachable: a recovery reuses the pinned front without racing,
+	// while a first connect races the public list as before and then asks the
+	// winner. The public answer stays the fallback either way.
+	conn.lease = accessLease{}
+	conn.publicFallback = nil
+	conn.accessOutcome = ""
+	wantAccess := s.accessWanted(conn, target)
+	if !wantAccess {
+		switch {
+		case s.installationKey() == nil:
+			conn.accessOutcome = accessOutcomeNoKey
+		case conn.accessUnsupported:
+			conn.accessOutcome = accessOutcomeUnsupported
+		default:
+			conn.accessOutcome = accessOutcomeNotRequested
+		}
+	}
+	triedFront := ""
+	if wantAccess && conn.accessFront != "" {
+		triedFront = conn.accessFront
+		fetch, ok, err := s.fetchAccess(ctx, conn, conn.accessFront, conn.accessAzureSNI, target)
+		if err != nil {
+			return discovery.Fetch{}, 0, err
+		}
+		if ok {
+			return fetch, time.Since(started).Milliseconds(), nil
+		}
+	}
 	fetch, err := s.relayFetcher()(ctx, brokerURL, limit, managerClientID(conn.mgr), s.SessionID())
 	if err != nil {
 		return discovery.Fetch{}, 0, err
 	}
+	conn.rememberPublicEndpoints(fetch.Response)
 	// All hosts follow the verified winner, including queued events and
 	// recovery fetches. In-flight uploads retain their captured endpoint.
 	_ = conn.mgr.SetBrokerFront(fetch.BrokerURL, fetch.AzureSNI)
+	if wantAccess && !conn.accessUnsupported && fetch.BrokerURL != triedFront {
+		conn.accessFront, conn.accessAzureSNI = fetch.BrokerURL, fetch.AzureSNI
+		access, ok, err := s.fetchAccess(ctx, conn, fetch.BrokerURL, fetch.AzureSNI, target)
+		if err != nil {
+			return discovery.Fetch{}, 0, err
+		}
+		if ok {
+			conn.publicFallback = &fetch
+			return access, time.Since(started).Milliseconds(), nil
+		}
+	}
 	return fetch, time.Since(started).Milliseconds(), nil
 }
 
@@ -1058,6 +1151,28 @@ func (s *Engine) attemptDirectCandidate(ctx context.Context, conn *connection, c
 	s.appendLog(fmt.Sprintf("trying relay %s at %s:%d", cand.ID, cand.PublicHost, cand.PublicPort))
 	s.appendLog("checking relay TCP reachability")
 	tcpMS, err := s.relayDialer()(ctx, cand.PublicHost, cand.PublicPort)
+	if err != nil && ctx.Err() == nil && !isSocketProtectionFailure(err) {
+		// An IPv6 endpoint that does not answer is retried once on the same
+		// relay's public endpoint, which accepts the same credential (see
+		// family.go). The candidate then carries that endpoint everywhere —
+		// config, route exclusions, telemetry — as if the answer had named it.
+		// A socket the host would not protect is a local failure, not an
+		// unanswered endpoint: it is reported as such, never retried.
+		if endpoint, ok := conn.publicEndpointFor(cand); ok {
+			s.appendLog(fmt.Sprintf("relay %s did not answer over IPv6 (%v); retrying at %s:%d", cand.ID, err, endpoint.host, endpoint.port))
+			cand.PublicHost, cand.PublicPort = endpoint.host, endpoint.port
+			tcpMS, err = s.relayDialer()(ctx, cand.PublicHost, cand.PublicPort)
+			if err == nil {
+				configInput = s.candidateConfigInput(cand, port)
+				if s.Mobile != nil {
+					configInput, err = s.mobileConfig(ctx, configInput)
+					if err != nil {
+						return nil, markLocalCandidateError("config", err)
+					}
+				}
+			}
+		}
+	}
 	if err != nil {
 		// A socket-protection refusal is classified local inside the marker.
 		return nil, markDirectPathError("tcp", err)
@@ -1319,6 +1434,7 @@ func (s *Engine) promote(ctx context.Context, conn *connection, res *candidateRe
 			if res.frontID != "" {
 				attrs["front_id"] = res.frontID
 			}
+			conn.accessAttributes(attrs, true)
 			conn.mgr.Record("connection_succeeded", res.relay.ID, attrs, connectMeasurements(res, brokerFetchMS))
 			_ = conn.mgr.Flush(ctx)
 		}
@@ -1499,6 +1615,7 @@ func (s *Engine) finalizeConn(conn *connection, stage string, err error) {
 			if detail := clienttelemetry.ErrorDetail(err); detail != "" {
 				attrs["failure_detail"] = detail
 			}
+			conn.accessAttributes(attrs, false)
 			conn.mgr.Record("connection_failed", "", attrs, nil)
 			conn.mgr.EndSession("connection_failed")
 			s.terminalFlush(conn)

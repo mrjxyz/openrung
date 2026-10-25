@@ -57,6 +57,11 @@ type RelayStore interface {
 	// renew leases replace a legacy relay's UUID with one nobody accepts.
 	Heartbeat(id, leaseToken, maxClass, clientID string, now time.Time, ttl time.Duration) (relay.Descriptor, error)
 	UpdateGeo(id, leaseToken string, geo relay.GeoLocation) error
+	// UpdateReachability records the outcome of an inbound probe of the
+	// relay's advertised endpoint, scoped like UpdateGeo to the registration
+	// holding leaseToken so a late result never describes a replacement
+	// descriptor. See reachability.go.
+	UpdateReachability(id, leaseToken string, reachable bool, checkedAt time.Time) error
 	List(time.Time, int) ([]relay.Descriptor, error)
 	// ListRanked is List plus the operator ranking weights the ranking applied,
 	// so page-shaping steps after the sort (the WSS reservation) and the
@@ -164,6 +169,7 @@ func (s *Store) Register(req relay.RegisterRequest, now time.Time, ttl time.Dura
 		LeaseToken:        leaseToken,
 		LeaseCapable:      req.AccessLeases && identityKey != nil,
 		Label:             req.Label,
+		OperatorContact:   req.OperatorContact,
 		NodeClass:         normalizeNodeClass(req.NodeClass),
 		PublicHost:        req.PublicHost,
 		PublicPort:        req.PublicPort,
@@ -185,6 +191,11 @@ func (s *Store) Register(req relay.RegisterRequest, now time.Time, ttl time.Dura
 		RegisteredAt:      now,
 		LastHeartbeatAt:   now,
 		ExpiresAt:         now.Add(ttl),
+	}
+	// Like the lease capability, an access host is honoured only on an
+	// identity-bearing registration; a legacy one's is dropped.
+	if identityKey != nil {
+		desc.AccessHost = req.AccessHost
 	}
 
 	s.mu.Lock()
@@ -290,6 +301,23 @@ func (s *Store) UpdateGeo(id, leaseToken string, geo relay.GeoLocation) error {
 	return nil
 }
 
+func (s *Store) UpdateReachability(id, leaseToken string, reachable bool, checkedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	desc, ok := s.relays[id]
+	if !ok {
+		return ErrRelayNotFound
+	}
+	if desc.IdentityPublicKey != "" && (desc.LeaseToken == "" || subtle.ConstantTimeCompare([]byte(desc.LeaseToken), []byte(leaseToken)) != 1) {
+		return ErrRelayNotFound
+	}
+	desc.Reachable = reachable
+	desc.ReachabilityCheckedAt = checkedAt
+	s.relays[id] = desc
+	return nil
+}
+
 func (s *Store) List(now time.Time, limit int) ([]relay.Descriptor, error) {
 	relays, _, err := s.ListRanked(now, limit)
 	return relays, err
@@ -307,7 +335,7 @@ func (s *Store) ListRanked(now time.Time, limit int) ([]relay.Descriptor, map[st
 	}
 
 	snapshots, weights := s.metricSnapshotsLocked(now)
-	sortRelayCandidates(relays, snapshots, weights)
+	sortRelayCandidates(relays, snapshots, weights, rankingUniform)
 
 	if limit > 0 && len(relays) > limit {
 		return relays[:limit], weights, nil

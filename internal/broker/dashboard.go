@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -29,10 +30,24 @@ const (
 //go:embed dashboard.html
 var dashboardHTML []byte
 
-// dashboardJS holds the helpers both dashboard pages share.
+//go:embed login.html
+var loginHTML []byte
+
+// dashboardJS and dashboardCSS hold the helpers and the stylesheet every
+// dashboard page shares.
 //
 //go:embed dashboard.js
 var dashboardJS []byte
+
+//go:embed dashboard.css
+var dashboardCSS []byte
+
+// Page placeholders substituted once, at registration, so every page's
+// footer names the running broker build without a further request.
+const (
+	versionPlaceholder  = "%%BROKER_VERSION%%"
+	revisionPlaceholder = "%%BROKER_REVISION%%"
+)
 
 // relayDisplay is how the dashboard identifies an active relay: its
 // operator-supplied label (may be empty, in which case views fall back to the
@@ -44,8 +59,12 @@ type relayDisplay struct {
 }
 
 type dashboardServer struct {
-	tokenHash     [32]byte
-	querier       TelemetryQuerier
+	tokenHash [32]byte
+	querier   TelemetryQuerier
+	// version and revision identify the broker build in every page footer;
+	// empty values render as "dev" and no revision.
+	version       string
+	revision      string
 	relayDisplays func() map[string]relayDisplay
 	// relayDirectory feeds the relays page the currently registered descriptor
 	// set; nil (only in tests that never exercise that page) renders every
@@ -55,7 +74,12 @@ type dashboardServer struct {
 	// (only in tests that never touch them) answers them with 503. The
 	// column itself is fed by relayDirectory's ListRanked.
 	relayWeights relayRankingWeightStore
-	// clientIP resolves the caller's address for the weight-change audit log;
+	// users and userStatus back the users page; nil (a broker without
+	// client users, or tests that never touch the page) answers its API
+	// routes with 503.
+	users      userDirectory
+	userStatus userStatusSetter
+	// clientIP resolves the caller's address for the change audit logs;
 	// NewServer installs the broker's proxy-aware resolver.
 	clientIP func(*http.Request) string
 	now      func() time.Time
@@ -74,28 +98,72 @@ func newDashboardServer(token string, querier TelemetryQuerier) *dashboardServer
 }
 
 func (d *dashboardServer) register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /admin/telemetry/login", d.loginPage)
-	mux.HandleFunc("POST /admin/telemetry/login", d.login)
-	mux.HandleFunc("POST /admin/telemetry/logout", d.logout)
-	mux.HandleFunc("GET /admin/telemetry", d.requireAuth(servePage(dashboardHTML)))
-	mux.HandleFunc("GET /admin/telemetry/relays", d.requireAuth(servePage(relaysHTML)))
-	mux.HandleFunc("GET /admin/telemetry/dashboard.js", d.requireAuth(serveAsset("text/javascript; charset=utf-8", dashboardJS)))
-	mux.HandleFunc("GET /admin/api/telemetry/overview", d.requireAuth(d.overview))
-	mux.HandleFunc("GET /admin/api/telemetry/sessions", d.requireAuth(d.listSessions))
-	mux.HandleFunc("GET /admin/api/telemetry/relays", d.requireAuth(d.relaysPanel))
-	mux.HandleFunc("PUT /admin/api/telemetry/relays/{id}/weight", d.requireAuth(d.setRelayWeight))
-	mux.HandleFunc("DELETE /admin/api/telemetry/relays/{id}/weight", d.requireAuth(d.deleteRelayWeight))
+	mux.HandleFunc("GET /admin/dashboard/login", d.loginPage(d.renderPage(loginHTML)))
+	mux.HandleFunc("POST /admin/dashboard/login", d.login)
+	mux.HandleFunc("POST /admin/dashboard/logout", d.logout)
+	mux.HandleFunc("GET /admin/dashboard", d.requireAuth(servePage(d.renderPage(dashboardHTML))))
+	mux.HandleFunc("GET /admin/dashboard/relays", d.requireAuth(servePage(d.renderPage(relaysHTML))))
+	mux.HandleFunc("GET /admin/dashboard/users", d.requireAuth(servePage(d.renderPage(usersHTML))))
+	mux.HandleFunc("GET /admin/dashboard/dashboard.js", d.requireAuth(serveAsset("text/javascript; charset=utf-8", dashboardJS)))
+	mux.HandleFunc("GET /admin/dashboard/dashboard.css", d.requireAuth(serveAsset("text/css; charset=utf-8", dashboardCSS)))
+	mux.HandleFunc("GET /admin/api/dashboard/overview", d.requireAuth(d.overview))
+	mux.HandleFunc("GET /admin/api/dashboard/sessions", d.requireAuth(d.listSessions))
+	mux.HandleFunc("GET /admin/api/dashboard/relays", d.requireAuth(d.relaysPanel))
+	mux.HandleFunc("PUT /admin/api/dashboard/relays/{id}/weight", d.requireAuth(d.setRelayWeight))
+	mux.HandleFunc("DELETE /admin/api/dashboard/relays/{id}/weight", d.requireAuth(d.deleteRelayWeight))
+	mux.HandleFunc("GET /admin/api/dashboard/users", d.requireAuth(d.listUsers))
+	mux.HandleFunc("GET /admin/api/dashboard/users/{ref}", d.requireAuth(d.userDetail))
+	mux.HandleFunc("PUT /admin/api/dashboard/users/{id}/status", d.requireAuth(d.putUserStatus))
 }
 
-func (d *dashboardServer) loginPage(w http.ResponseWriter, r *http.Request) {
-	if d.authenticated(r) {
-		http.Redirect(w, r, "/admin/telemetry", http.StatusSeeOther)
-		return
+// renderPage fills a page's build-identity placeholders. The values come
+// from the operator's build (ldflags or the VERSION file), but are escaped
+// regardless so an odd revision string cannot break the markup.
+func (d *dashboardServer) renderPage(page []byte) []byte {
+	version := d.version
+	if version == "" {
+		version = "dev"
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write([]byte(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenRung telemetry login</title><style>body{margin:0;background:#07100b;color:#e9f7ee;font:16px ui-monospace,SFMono-Regular,Menlo,monospace;display:grid;min-height:100vh;place-items:center}.box{width:min(88vw,390px);padding:30px;border:1px solid #245c37;background:#0b1710;box-shadow:0 18px 80px #0008}h1{font-size:22px;color:#55e27b}label,input,button{display:block;width:100%;box-sizing:border-box}label{margin:22px 0 8px;color:#a9c9b3}input{padding:12px;background:#06100a;border:1px solid #327448;color:#fff;font:inherit}button{margin-top:16px;padding:12px;border:0;background:#55e27b;color:#061008;font:700 15px inherit;cursor:pointer}.error{color:#ff7f87}</style></head><body><main class="box"><h1>OpenRung telemetry</h1><p>Administrator access</p><form method="post" action="/admin/telemetry/login"><label for="token">Dashboard token</label><input id="token" name="token" type="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form></main></body></html>`))
+	out := strings.ReplaceAll(string(page), versionPlaceholder, html.EscapeString(version))
+	return []byte(strings.ReplaceAll(out, revisionPlaceholder, html.EscapeString(shortRevision(d.revision))))
+}
+
+// shortRevision abbreviates a VCS hash to its first seven characters while
+// keeping buildinfo's "-dirty" suffix; non-hash values pass through.
+func shortRevision(revision string) string {
+	if revision == "" || revision == "unknown" {
+		return ""
+	}
+	hash, dirty := strings.CutSuffix(revision, "-dirty")
+	if len(hash) > 7 && isHex(hash) {
+		hash = hash[:7]
+	}
+	if dirty {
+		return hash + "-dirty"
+	}
+	return hash
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *dashboardServer) loginPage(page []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if d.authenticated(r) {
+			http.Redirect(w, r, "/admin/dashboard", http.StatusSeeOther)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		_, _ = w.Write(page)
+	}
 }
 
 func (d *dashboardServer) login(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +200,7 @@ func (d *dashboardServer) login(w http.ResponseWriter, r *http.Request) {
 		Secure:   requestIsHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
 	})
-	http.Redirect(w, r, "/admin/telemetry", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin/dashboard", http.StatusSeeOther)
 }
 
 func (d *dashboardServer) logout(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +213,7 @@ func (d *dashboardServer) logout(w http.ResponseWriter, r *http.Request) {
 		Name: dashboardCookieName, Value: "", Path: "/admin", MaxAge: -1,
 		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteStrictMode,
 	})
-	http.Redirect(w, r, "/admin/telemetry/login", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin/dashboard/login", http.StatusSeeOther)
 }
 
 func (d *dashboardServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -162,7 +230,7 @@ func (d *dashboardServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			if strings.HasPrefix(r.URL.Path, "/admin/api/") {
 				writeError(w, http.StatusUnauthorized, "dashboard session expired")
 			} else {
-				http.Redirect(w, r, "/admin/telemetry/login", http.StatusSeeOther)
+				http.Redirect(w, r, "/admin/dashboard/login", http.StatusSeeOther)
 			}
 			return
 		}
@@ -224,7 +292,7 @@ func serveAsset(contentType string, body []byte) http.HandlerFunc {
 func (d *dashboardServer) overview(w http.ResponseWriter, r *http.Request) {
 	window, ok := dashboardWindow(r.URL.Query().Get("window"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "window must be 1h, 24h, or 7d")
+		writeError(w, http.StatusBadRequest, dashboardWindowError)
 		return
 	}
 	now := d.now().UTC()
@@ -253,7 +321,7 @@ func (d *dashboardServer) listSessions(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	window, ok := dashboardWindow(query.Get("window"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "window must be 1h, 24h, or 7d")
+		writeError(w, http.StatusBadRequest, dashboardWindowError)
 		return
 	}
 	offset, err := queryInt(query.Get("offset"), 0)
@@ -293,6 +361,12 @@ func queryInt(raw string, fallback int) (int, error) {
 	return strconv.Atoi(raw)
 }
 
+// dashboardWindowError is the 400 message for a window dashboardWindow rejects.
+const dashboardWindowError = "window must be 1h, 24h, 7d, 14d, or 31d"
+
+// dashboardWindow parses the dashboard's history window. The windows past 7d
+// outlast the raw events, so only the Postgres rollup serves them in full; an
+// in-memory store answers them with what it retains.
 func dashboardWindow(raw string) (time.Duration, bool) {
 	switch raw {
 	case "", "24h":
@@ -300,10 +374,23 @@ func dashboardWindow(raw string) (time.Duration, bool) {
 	case "1h":
 		return time.Hour, true
 	case "7d":
-		return telemetryRetention, true
+		return 7 * 24 * time.Hour, true
+	case "14d":
+		return 14 * 24 * time.Hour, true
+	case "31d":
+		return 31 * 24 * time.Hour, true
 	default:
 		return 0, false
 	}
+}
+
+// telemetryTrendBucket is the trend's bucket width: hourly up to a week, daily
+// (UTC days) beyond, so the long windows' payload stays a few dozen points.
+func telemetryTrendBucket(window time.Duration) time.Duration {
+	if window > 7*24*time.Hour {
+		return 24 * time.Hour
+	}
+	return time.Hour
 }
 
 type telemetryOverview struct {
@@ -323,6 +410,13 @@ type telemetryOverview struct {
 	ActiveOS        []countSummary `json:"active_by_os"`
 	FailureStages   []countSummary `json:"failure_stages"`
 	FailureReasons  []countSummary `json:"failure_reasons"`
+	// AccessOutcomes counts connects by how the per-user access path went
+	// (the access_outcome attribute on connection_succeeded and
+	// connection_failed); RelaySources counts successful connects by where
+	// the relay came from (relay_source). Both token sets are closed, pinned
+	// by connectcore's access_outcome contract vectors.
+	AccessOutcomes []countSummary `json:"access_outcomes"`
+	RelaySources   []countSummary `json:"relay_sources"`
 	// Recent is the window's full session list, ordered newest-last-seen first.
 	// It is not serialized (the dashboard reads sessions from the dedicated
 	// endpoint): it exists only so the in-memory querier can paginate its
@@ -456,6 +550,10 @@ func (a *sessionAccumulator) finalize(now time.Time) sessionSummary {
 	return summary
 }
 
+// accessPanelLimit caps the access panels; the token sets are closed and
+// smaller than this, so the panels are never truncated.
+const accessPanelLimit = 16
+
 // buildTelemetryOverview aggregates stored records; appCounts is the hourly
 // application-connection rollup slice for the window (top-apps comes only from
 // there — application_connection events are never stored as records, and any
@@ -466,6 +564,8 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 	sessions := make(map[string]*sessionAccumulator)
 	failures := make(map[string]int)
 	failureReasons := make(map[string]int)
+	accessOutcomes := make(map[string]int)
+	relaySources := make(map[string]int)
 	relays := make(map[string]*relaySummary)
 	relayClasses := make(map[string]string)
 	relayFailureReasons := make(map[string]map[string]int)
@@ -475,8 +575,9 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 	}
 	speeds := make(map[string]*speedAccumulator)
 	buckets := make(map[time.Time]*trendPoint)
+	bucketWidth := telemetryTrendBucket(window)
 
-	for bucket := start.Truncate(time.Hour); !bucket.After(now); bucket = bucket.Add(time.Hour) {
+	for bucket := start.Truncate(bucketWidth); !bucket.After(now); bucket = bucket.Add(bucketWidth) {
 		buckets[bucket] = &trendPoint{Time: bucket}
 	}
 	for _, record := range records {
@@ -561,7 +662,7 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 		if received := event.Measurements["bytes_received"]; received > session.summary.BytesReceived {
 			session.summary.BytesReceived = received
 		}
-		bucket := buckets[event.OccurredAt.Truncate(time.Hour)]
+		bucket := buckets[event.OccurredAt.Truncate(bucketWidth)]
 		switch event.Event {
 		case "connection_attempted":
 			session.attempted = true
@@ -576,6 +677,12 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 			if event.RelayID != "" {
 				relayFor(relays, event.RelayID).Successes++
 			}
+			if outcome := event.Attributes["access_outcome"]; outcome != "" {
+				accessOutcomes[outcome]++
+			}
+			if source := event.Attributes["relay_source"]; source != "" {
+				relaySources[source]++
+			}
 		case "relay_failover":
 			// A failover is a successful relay observation, but not another
 			// session-level success or connection-trend success.
@@ -587,6 +694,9 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 			session.terminal = true
 			if bucket != nil {
 				bucket.Failures++
+			}
+			if outcome := event.Attributes["access_outcome"]; outcome != "" {
+				accessOutcomes[outcome]++
 			}
 			stageLabel := firstNonEmpty(event.Attributes["failure_stage"], "unknown")
 			// New-style classified reason preferred; fall back to the error_type
@@ -713,6 +823,8 @@ func buildTelemetryOverview(records []TelemetryRecord, appCounts map[string]int,
 	overview.ActiveOS = sortedCounts(activeOS, 10)
 	overview.FailureStages = sortedCounts(failures, 10)
 	overview.FailureReasons = sortedCounts(failureReasons, 10)
+	overview.AccessOutcomes = sortedCounts(accessOutcomes, accessPanelLimit)
+	overview.RelaySources = sortedCounts(relaySources, accessPanelLimit)
 	for relayID, speed := range speeds {
 		overview.SpeedTests = append(overview.SpeedTests, speedTestSummary{RelayID: relayID, Tests: speed.tests, AverageMbps: float64(speed.mbps) / float64(speed.tests) / 1000, AverageTTFBMS: float64(speed.ttfb) / float64(speed.tests)})
 	}
