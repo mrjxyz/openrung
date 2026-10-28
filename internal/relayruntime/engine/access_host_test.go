@@ -17,7 +17,10 @@ import (
 	"openrung/internal/relayruntime"
 )
 
-const testAccessHost = "2001:db8:1::10"
+const (
+	testAccessHost     = "2001:db8:1::10"
+	testIPv4AccessHost = "198.51.100.9"
+)
 
 func TestValidateAccessHost(t *testing.T) {
 	base := Config{
@@ -36,9 +39,18 @@ func TestValidateAccessHost(t *testing.T) {
 			t.Errorf("listen host %q rejected: %v", listenHost, err)
 		}
 	}
+	// An IPv4 access address beside an IPv6 public host is the mirror posture.
+	v4 := base
+	v4.PublicHost, v4.AccessHost = "2001:db8:1::1", testIPv4AccessHost
+	if err := v4.withDefaults().validate(); err != nil {
+		t.Fatalf("valid IPv4 access host config rejected: %v", err)
+	}
 	for name, mutate := range map[string]func(*Config){
-		"ipv4 access host":      func(c *Config) { c.AccessHost = "198.51.100.9" },
 		"private access host":   func(c *Config) { c.AccessHost = "fd00::10" },
+		"private ipv4":          func(c *Config) { c.AccessHost = "10.0.0.9" },
+		"cgnat ipv4":            func(c *Config) { c.AccessHost = "100.64.0.9" },
+		"ipv4-mapped":           func(c *Config) { c.AccessHost = "::ffff:198.51.100.9" },
+		"ipv4 same as public":   func(c *Config) { c.AccessHost = "203.0.113.7" },
 		"same as public host":   func(c *Config) { c.PublicHost = "2001:DB8:1:0::10" },
 		"tunnel mode":           func(c *Config) { c.Mode = ModeTunnel; c.HubAddr = "hub.test:9443" },
 		"auto mode with a hub":  func(c *Config) { c.Mode = ModeAuto; c.HubAddr = "hub.test:9443" },
@@ -157,6 +169,127 @@ func TestRegistrationCarriesVerifiedAccessHostOnly(t *testing.T) {
 	if _, _, third := broker.stats(); third.AccessHost != "" {
 		t.Fatalf("access host advertised although the host query failed: %q", third.AccessHost)
 	}
+}
+
+// fakeIPv4Host is a switchable stand-in for the IPv4 interface list and the
+// routing-table dump.
+type fakeIPv4Host struct {
+	mu        sync.Mutex
+	addresses []netip.Addr
+	routes    []relayruntime.IPv4Route
+}
+
+func (f *fakeIPv4Host) set(addresses []netip.Addr, routes []relayruntime.IPv4Route) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addresses, f.routes = addresses, routes
+}
+
+func (f *fakeIPv4Host) list() ([]netip.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addresses, nil
+}
+
+func (f *fakeIPv4Host) routeTable() ([]relayruntime.IPv4Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.routes, nil
+}
+
+// An IPv4 access address beside an IPv6 public host is advertised only while
+// it is on an interface and no route, for any destination, would make it the
+// source of outgoing IPv4; the IPv6 address flags are never consulted for it.
+func TestRegistrationCarriesVerifiedIPv4AccessHostOnly(t *testing.T) {
+	prev := accessRecheckInterval
+	accessRecheckInterval = 40 * time.Millisecond
+	t.Cleanup(func() { accessRecheckInterval = prev })
+
+	broker := &fakeBroker{}
+	ts := httptest.NewServer(broker.handler())
+	defer ts.Close()
+	log := &syncBuffer{}
+	const publicHost = "2001:db8:1::1"
+	eng := New(Config{
+		BrokerURL:   ts.URL,
+		Mode:        ModeDirect,
+		PublicHost:  publicHost,
+		AccessHost:  testIPv4AccessHost,
+		ListenPort:  freePort(t),
+		Identity:    testIdentity,
+		DisableXray: true,
+		ConfigDir:   t.TempDir(),
+	}, Events{Log: log})
+	eng.cfg.HeartbeatInterval = time.Hour // only the access recheck re-registers
+	primary, access := netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr(testIPv4AccessHost)
+	addresses := []netip.Addr{primary, access}
+	route := func(dst string, src netip.Addr) relayruntime.IPv4Route {
+		return relayruntime.IPv4Route{Table: 254, Dst: netip.MustParsePrefix(dst), PrefSrc: src}
+	}
+	isolated := []relayruntime.IPv4Route{route("0.0.0.0/0", primary), route("172.31.1.1/32", primary)}
+	host := &fakeIPv4Host{}
+	// The default route uses the primary, but one destination is sourced
+	// from the access address.
+	host.set(addresses, append(append([]relayruntime.IPv4Route(nil), isolated...), route("192.0.2.0/24", access)))
+	eng.hostIPv4Addresses, eng.ipv4Routes = host.list, host.routeTable
+	eng.hostAddresses = func() ([]relayruntime.HostAddress, error) {
+		t.Error("IPv6 address flags queried for an IPv4 access host")
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = eng.runDirectSession(ctx, &relayruntime.BrokerClient{BaseURL: ts.URL}, eng.cfg, "access-relay", testIdentity, "", directOnlyListenHost)
+	}()
+	defer func() { cancel(); <-done }()
+
+	eventually(t, 5*time.Second, "first registration", func() bool {
+		registers, _, _ := broker.stats()
+		return registers == 1
+	})
+	if _, _, first := broker.stats(); first.AccessHost != "" {
+		t.Fatalf("access host advertised although a route sources from it: %q", first.AccessHost)
+	}
+	if !strings.Contains(log.String(), "not advertising access host "+testIPv4AccessHost) ||
+		!strings.Contains(log.String(), "route to 192.0.2.0/24 (table 254) uses "+testIPv4AccessHost) {
+		t.Fatalf("missing refusal log line; log:\n%s", log.String())
+	}
+
+	// The operator removes that route; every route now names the primary.
+	host.set(addresses, isolated)
+	eventually(t, 5*time.Second, "advertised", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 2 && last.AccessHost == testIPv4AccessHost
+	})
+	_, _, second := broker.stats()
+	if second.PublicHost != publicHost {
+		t.Fatalf("public host = %q, want the configured IPv6 endpoint", second.PublicHost)
+	}
+	if _, err := relay.VerifyIdentity(second, time.Now()); err != nil {
+		t.Fatalf("identity proof with an IPv4 access_host does not verify: %v", err)
+	}
+
+	// A route without a preferred source withdraws it: the kernel may pick
+	// the access address for that destination.
+	host.set(addresses, append(append([]relayruntime.IPv4Route(nil), isolated...), route("198.18.0.0/15", netip.Addr{})))
+	eventually(t, 5*time.Second, "withdrawn for a route without src", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 3 && last.AccessHost == ""
+	})
+
+	// Restored, then the address leaves the interface.
+	host.set(addresses, isolated)
+	eventually(t, 5*time.Second, "restored", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 4 && last.AccessHost == testIPv4AccessHost
+	})
+	host.set([]netip.Addr{primary}, isolated)
+	eventually(t, 5*time.Second, "withdrawn when absent", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 5 && last.AccessHost == ""
+	})
 }
 
 // Without an access host configured the host is never queried and nothing

@@ -386,8 +386,8 @@ not need to match.
   changes.
 
 - **Access address (Foundation, optional):** `OPENRUNG_ACCESS_HOST` names one
-  extra IPv6 address, distinct from the relay's primary address and its
-  `OPENRUNG_PUBLIC_HOST`, that the relay serves on the same listener and
+  extra IPv6 (or, see below, IPv4) address, distinct from the relay's primary
+  address and its `OPENRUNG_PUBLIC_HOST`, that the relay serves on the same listener and
   sends privately at registration as `access_host`. The broker then names
   that address instead of the public host in the per-user access answer
   (`POST /api/v1/access`, see [docs/api.md](../../docs/api.md)); the
@@ -441,6 +441,23 @@ not need to match.
   value, which re-registers the relay. The fleet audit reports `access=none`, or the address
   with `access_state=present|missing|preferred`, whether its unit is enabled
   and whether its re-assert timer is active (`access_reassert=`). Volunteer relays (`volunteer-up.sh`, the desktop app) never set it.
+
+  An access address may also be IPv4, typically beside an IPv6
+  `OPENRUNG_PUBLIC_HOST`. IPv4 has no deprecated state, so isolation comes
+  from the routing tables: an outgoing connection takes the matching route's
+  preferred source (`src`), and a route without one lets the kernel pick an
+  interface address, which may be the access address. The host therefore
+  adds it (for example `ip -4 address add <IPv4>/32 dev <interface>`) where
+  every IPv4 unicast route, in every table, names a `src` other than the
+  access address (`ip -4 route show table all type unicast` lists them; DHCP
+  routes from systemd-networkd carry one, a static route needs
+  `src <primary>`). Before every registration, and on the same 30-second
+  recheck, the relay confirms with read-only netlink dumps that the address
+  is on a host interface and that rule holds; otherwise it logs
+  `not advertising access host …` with the offending route and registers
+  without it. The broker names an IPv4 access address in every access
+  answer, whatever address family the request arrived over. The listener,
+  mode and public-host rules are the same as for IPv6.
 
 ## Operations
 
