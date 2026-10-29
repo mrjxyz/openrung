@@ -5,6 +5,7 @@ package relayruntime
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 )
 
@@ -24,8 +25,9 @@ type HostAddress struct {
 }
 
 // ErrHostAddressesUnsupported reports a platform without the read-only
-// address query VerifyAccessAddress needs (everything but Linux).
-var ErrHostAddressesUnsupported = errors.New("listing host interface addresses with their flags is supported on Linux only")
+// address and route queries the access-address checks need (everything but
+// Linux).
+var ErrHostAddressesUnsupported = errors.New("listing host interface addresses with their flags, and routing tables, is supported on Linux only")
 
 // VerifyAccessAddress reports whether addr is usable as the relay's access
 // address among the host's configured addresses: present on an interface,
@@ -50,4 +52,61 @@ func VerifyAccessAddress(addr netip.Addr, configured []HostAddress) error {
 		return nil
 	}
 	return fmt.Errorf("%s is not configured on any host interface", addr)
+}
+
+// IPv4Route is one IPv4 unicast route from any of the host's routing tables,
+// with the fields the IPv4 access-address check reads.
+type IPv4Route struct {
+	Table uint32
+	Dst   netip.Prefix
+	// PrefSrc is the route's preferred source address ("src"), or the zero
+	// Addr when the route names none and the kernel picks one per lookup.
+	PrefSrc netip.Addr
+}
+
+// HostIPv4Addresses lists the IPv4 addresses configured on the host's
+// interfaces.
+func HostIPv4Addresses() ([]netip.Addr, error) {
+	interfaceAddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("list interface addresses: %w", err)
+	}
+	var addresses []netip.Addr
+	for _, interfaceAddr := range interfaceAddrs {
+		if ip, ok := netip.AddrFromSlice(addressIP(interfaceAddr)); ok && ip.Unmap().Is4() {
+			addresses = append(addresses, ip.Unmap())
+		}
+	}
+	return addresses, nil
+}
+
+// VerifyIPv4AccessAddress reports whether addr is usable as the relay's IPv4
+// access address: present on an interface, and never the source of outgoing
+// IPv4. IPv4 has no deprecated state, so the guarantee comes from the routing
+// tables instead: an unbound socket's source is the matching route's
+// preferred source when it names one, and otherwise an address the kernel
+// picks from the interface, which can be the access address. So every
+// unicast route in every table must name a preferred source other than addr.
+// Local and broadcast routes carry no outgoing internet traffic and are not
+// unicast routes, so they are not listed.
+func VerifyIPv4AccessAddress(addr netip.Addr, configured []netip.Addr, routes []IPv4Route) error {
+	present := false
+	for _, candidate := range configured {
+		if candidate == addr {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return fmt.Errorf("%s is not configured on any host interface", addr)
+	}
+	for _, route := range routes {
+		switch {
+		case !route.PrefSrc.IsValid():
+			return fmt.Errorf("the route to %s (table %d) names no preferred source (src), so the kernel may pick %s as the source of outgoing IPv4, which must stay on the primary address", route.Dst, route.Table, addr)
+		case route.PrefSrc == addr:
+			return fmt.Errorf("the route to %s (table %d) uses %s as its source, which must stay on the primary address", route.Dst, route.Table, addr)
+		}
+	}
+	return nil
 }
