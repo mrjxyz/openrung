@@ -221,7 +221,7 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		operational := func(next http.HandlerFunc) http.HandlerFunc {
 			return rateLimited(operationalLimiter, clientIP, inventoryRetryAfterSeconds, next)
 		}
-		mux.HandleFunc("/admin/api/relays/inventory", operational(relayInventoryHandler(store, cfg.APIToken, relaySigner)))
+		mux.HandleFunc("/admin/api/relays/inventory", operational(relayInventoryHandler(store, cfg.APIToken, relaySigner, cfg.RelayProber != nil)))
 		mux.HandleFunc("/admin/api/relays/weights", operational(relayWeightsListHandler(store, cfg.APIToken)))
 		mux.HandleFunc("/admin/api/relays/{id}/weight", operational(relayWeightHandler(store, cfg.APIToken, clientIP.clientIP)))
 		if users != nil {
@@ -262,6 +262,7 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		dashboard.version, dashboard.revision = cfg.Version, cfg.Revision
 		dashboard.relayDisplays = relayDisplayResolver(store)
 		dashboard.relayDirectory = store
+		dashboard.withholdUnreachable = cfg.RelayProber != nil
 		dashboard.relayWeights = store
 		dashboard.clientIP = clientIP.clientIP
 		// The users page follows the operational user routes: it exists
@@ -564,13 +565,13 @@ func listRelaysHandler(store RelayStore, telemetrySink TelemetrySink, clientIP *
 		// Ask both stores for the ranked set, then reserve one already-advertised
 		// per-relay WSS-capable Foundation descriptor in a short page. This never
 		// attaches a shared URL or changes ordering when the page already has one.
-		relays, weights, err := store.ListRanked(now, 0)
+		relays, ranking, err := store.ListRanked(now, 0)
 		if err != nil {
 			slog.Error("could not list relays", "error", err)
 			writeError(w, http.StatusServiceUnavailable, "could not list relays")
 			return
 		}
-		relays = reserveWSSCandidate(withoutUnreachable(relays, withholdUnreachable), limit, weights)
+		relays = reserveWSSCandidate(withoutUnreachable(relays, withholdUnreachable), limit, ranking.Weights)
 		s.writeSigned(w, relay.ListResponse{
 			Count:      len(relays),
 			ServerTime: now,
