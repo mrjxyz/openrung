@@ -45,7 +45,9 @@ const (
 // holding the operational API token. The route is only registered when that
 // token is configured (see NewServer), so an unconfigured broker answers 404
 // rather than exposing the endpoint in an open state.
-func relayInventoryHandler(store RelayStore, apiToken string, s signer) http.HandlerFunc {
+// withholdUnreachable is the public list's reachability policy (probing
+// enabled), so head shares describe the list clients actually get.
+func relayInventoryHandler(store RelayStore, apiToken string, s signer, withholdUnreachable bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A credentialed snapshot of live fleet state: no browser, proxy, or
 		// CDN edge may retain any part of it. Set before anything else so the
@@ -77,7 +79,7 @@ func relayInventoryHandler(store RelayStore, apiToken string, s signer) http.Han
 		// limit 0 is the store's unbounded read. Operators need the whole
 		// fleet; a page would make "relay missing from the inventory" and
 		// "relay ranked below the cut" indistinguishable.
-		relays, weights, err := store.ListRanked(now, 0)
+		relays, ranking, err := store.ListRanked(now, 0)
 		if err != nil {
 			slog.Error("could not list relays for inventory", "error", err)
 			writeError(w, http.StatusServiceUnavailable, "could not list relays")
@@ -99,7 +101,7 @@ func relayInventoryHandler(store RelayStore, apiToken string, s signer) http.Han
 			Channel:    normalized.Channel,
 			// No limit field: the inventory is not request-shaped and is never
 			// truncated, so there is nothing to echo.
-			Relays: decorateInventory(normalized.Relays, weights),
+			Relays: decorateInventory(normalized.Relays, ranking, withholdUnreachable),
 		})
 	}
 }
@@ -120,7 +122,8 @@ type inventoryResponse struct {
 
 // inventoryDescriptor is a public descriptor plus the operator-only state the
 // broker holds about it: the effective ranking weight it is applying right
-// now (defaultRankingWeight when no override is stored), the latest inbound
+// now (defaultRankingWeight when no override is stored) and the telemetry
+// score breakdown it is ranking with (see rankRelays), the latest inbound
 // reachability probe, the operator contact the relay registered with, and its
 // access address. All are operational state — they exist so fleet tooling can
 // see where an operator has shifted load, which relays the broker is
@@ -130,6 +133,7 @@ type inventoryResponse struct {
 type inventoryDescriptor struct {
 	relay.Descriptor
 	RankingWeight float64
+	Ranking       relayRanking
 }
 
 // inventoryState is the trailing operator-only block of an inventory
@@ -138,11 +142,12 @@ type inventoryDescriptor struct {
 // reachability_checked_at is omitted in the same case. operator_contact and
 // access_host are omitted when the registration carried none.
 type inventoryState struct {
-	RankingWeight         float64    `json:"ranking_weight"`
-	Reachable             *bool      `json:"reachable"`
-	ReachabilityCheckedAt *time.Time `json:"reachability_checked_at,omitempty"`
-	OperatorContact       string     `json:"operator_contact,omitempty"`
-	AccessHost            string     `json:"access_host,omitempty"`
+	RankingWeight         float64      `json:"ranking_weight"`
+	Ranking               relayRanking `json:"ranking"`
+	Reachable             *bool        `json:"reachable"`
+	ReachabilityCheckedAt *time.Time   `json:"reachability_checked_at,omitempty"`
+	OperatorContact       string       `json:"operator_contact,omitempty"`
+	AccessHost            string       `json:"access_host,omitempty"`
 }
 
 // MarshalJSON emits the descriptor exactly as the public channels do (through
@@ -160,6 +165,7 @@ func (d inventoryDescriptor) MarshalJSON() ([]byte, error) {
 	}
 	state, err := json.Marshal(inventoryState{
 		RankingWeight:         d.RankingWeight,
+		Ranking:               d.Ranking,
 		Reachable:             reachablePointer(d.Descriptor),
 		ReachabilityCheckedAt: timePointer(d.ReachabilityCheckedAt),
 		OperatorContact:       d.OperatorContact,
@@ -172,11 +178,12 @@ func (d inventoryDescriptor) MarshalJSON() ([]byte, error) {
 	return append(body, state[1:]...), nil
 }
 
-func decorateInventory(relays []relay.Descriptor, weights map[string]float64) []inventoryDescriptor {
+func decorateInventory(relays []relay.Descriptor, inputs RankingInputs, withholdUnreachable bool) []inventoryDescriptor {
 	// Keep the wire shape an array for an empty fleet, like every signed channel.
+	rankings := rankRelays(relays, inputs, withholdUnreachable)
 	decorated := make([]inventoryDescriptor, len(relays))
 	for i, desc := range relays {
-		decorated[i] = inventoryDescriptor{Descriptor: desc, RankingWeight: rankingWeightFor(weights, desc.ID)}
+		decorated[i] = inventoryDescriptor{Descriptor: desc, RankingWeight: rankingWeightFor(inputs.Weights, desc.ID), Ranking: rankings[desc.ID]}
 	}
 	return decorated
 }
