@@ -202,6 +202,40 @@ than the kernel defaults (cubic, reno) is left as configured, a kernel without
 BBR only gets a warning, and `OPENRUNG_TCP_TUNING=0` in the one-line command
 skips the step on any run. To undo it, delete the two files and reboot.
 
+Once the relay is verified and serving, the script also loads the relay
+image's [new-destination limit](#networking-notes) on the host, as the Foundation
+fleet does: the host may connect to at most 10 addresses per second that it
+has not contacted in the last 10 minutes. Addresses already in use are never
+limited, so ordinary traffic is unaffected; it bounds a client using the relay
+to scan, which is what draws abuse reports to a server's owner. It lives in
+its own nftables table and leaves ufw, firewalld and other rulesets alone.
+The script installs `nftables` on apt-based systems when missing and enables
+the limit's boot unit; `OPENRUNG_NEW_DEST_RATE` sets the rate on any run, and
+`OPENRUNG_NEW_DEST_RATE=off` removes the limit. A host where it cannot load
+only gets a warning; the relay serves either way.
+
+The relay's public address is the server's IPv4. On a server with a public
+IPv6 /64, `OPENRUNG_ACCESS_ADDRESS=1` in the one-line command also gives the
+relay an **access address** (see Networking notes): a random address in that
+/64, added deprecated so the relay's own traffic never uses it, recorded as
+`OPENRUNG_ACCESS_HOST` in the env file and kept by
+`openrung-access-address.service` and
+`openrung-access-address-reassert.timer`, named as on the Foundation fleet. The
+relay sends it privately at registration; it never appears in the public relay
+directory, and the broker hands it to enrolled IPv6 clients instead of the
+public address. The broker checks only that the public address accepts
+connections, so this is opt-in: allow inbound TCP 443 over IPv6 (`::/0`) in
+the provider's firewall first. Before keeping the address, the script sends
+one HTTPS request from it to a public DNS resolver's web front, proving the
+provider routes the address to the server; providers that assign IPv6
+addresses one by one (AWS, Google Cloud, Azure and others) fail that check,
+and the address is removed again. Unique local (`fc00::/7`) prefixes are
+never used. A server without a public IPv6 /64, without systemd, or with a
+hand-customised mode, listen host or connection logging gets none, and the
+relay serves on its public address alone. A recorded value, empty or not, is
+kept on every later run. To remove an address, disable and delete the three
+units, set `OPENRUNG_ACCESS_HOST=` in the env file and re-run.
+
 Overrides pass through `sudo env`, e.g.:
 
 ```sh
@@ -391,11 +425,13 @@ not need to match.
   The Foundation's fleet audit reports, per host, the relay version,
   whether the saved rules and the installed script match that relay's image,
   whether the host has `nftables`, whether the table is loaded, whether the
-  boot unit is enabled, and the access address state (below). Volunteer
-  relays (`volunteer-up.sh`, the desktop app) never get host firewall
-  changes.
+  boot unit is enabled, and the access address state (below).
+  `volunteer-up.sh` loads the same limit after every verified install or
+  update (`OPENRUNG_NEW_DEST_RATE` on its one-line command sets the rate;
+  `off` removes it). The desktop volunteer app never changes the host
+  firewall.
 
-- **Access address (Foundation, optional):** `OPENRUNG_ACCESS_HOST` names one
+- **Access address (optional):** `OPENRUNG_ACCESS_HOST` names one
   extra IPv6 (or, see below, IPv4) address, distinct from the relay's primary
   address and its `OPENRUNG_PUBLIC_HOST`, that the relay serves on the same listener and
   sends privately at registration as `access_host`. The broker then names
@@ -450,7 +486,9 @@ not need to match.
   host has. The address is static: changing it is a roll with the new
   value, which re-registers the relay. The fleet audit reports `access=none`, or the address
   with `access_state=present|missing|preferred`, whether its unit is enabled
-  and whether its re-assert timer is active (`access_reassert=`). Volunteer relays (`volunteer-up.sh`, the desktop app) never set it.
+  and whether its re-assert timer is active (`access_reassert=`). `volunteer-up.sh`
+  gives volunteer relays an IPv6 access address on request (see the one-line
+  bring-up above); the desktop app never sets one.
 
   An access address may also be IPv4, typically beside an IPv6
   `OPENRUNG_PUBLIC_HOST`. IPv4 has no deprecated state, so isolation comes
