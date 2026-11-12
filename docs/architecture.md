@@ -31,7 +31,7 @@ The broker does:
 - Accept relay registration.
 - Track relay heartbeats.
 - Expire stale relays.
-- Return a small ranked candidate set to clients using recent relay load, success, latency, and speed-test signals.
+- Return a small ranked candidate set to clients using recent relay load, success, latency, and handshake-retransmission signals.
 - Optionally persist relay state in PostgreSQL so multiple broker instances can share one relay view behind a load balancer.
 - Keep experimental relay/session/metric fields in JSONB columns until they are stable enough to promote into indexed columns.
 
@@ -466,8 +466,8 @@ machine mirroring the mobile native bridge contract, so every client that
 drives it behaves like the mobile reference implementation.
 
 Its subpackages carry the rest of the client policy layer: `client` (the
-sing-box config builder for both capture modes and mobile's DNS/split-tunnel
-shapes, the sing-box process runner, relay usability and selection, and thin
+sing-box config builder for both capture modes, mobile's DNS shape and the
+split-tunnel rules, the sing-box process runner, relay usability and selection, and thin
 broker-client adapters), `clienttelemetry` (the closed failure-reason
 classifier and the telemetry event model, outbox, and session manager),
 `discovery` (staggered multi-front directory fetching over `brokerapi`,

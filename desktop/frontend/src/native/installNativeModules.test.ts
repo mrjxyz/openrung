@@ -5,7 +5,7 @@ import { installNativeModules } from './installNativeModules';
 
 interface BrokerModule {
   firstReachable(requestId: string, primary: string): Promise<Record<string, unknown>>;
-  runSpeedTest(): Promise<unknown>;
+  fetchManifestCandidate(): Promise<unknown>;
 }
 interface VpnModule {
   connect(brokerUrl: string, country: string | null, relayId: string | null): Promise<void>;
@@ -16,6 +16,8 @@ interface DesktopModule {
   appVersion: string;
   getProxyInfo(): Promise<{ endpoint: string }>;
   copyText(text: string): Promise<void>;
+  getTunnelMode(): Promise<{ mode: string; available: boolean; requiresRestart: boolean }>;
+  setTunnelMode(mode: string): Promise<void>;
 }
 
 const modules = NativeModules as {
@@ -33,6 +35,7 @@ function fakeWails() {
     Disconnect: vi.fn(async () => undefined),
     GetState: vi.fn(async () => ({ status: 'disconnected' })),
     GetIdentity: vi.fn(async () => ({ clientId: 'client-1', sessionId: null })),
+    SetSplitTunnelConfig: vi.fn(async () => undefined),
     GetProxyInfo: vi.fn(async () => ({
       endpoint: '127.0.0.1:4000',
       persistenceWarning: null,
@@ -41,6 +44,12 @@ function fakeWails() {
       enableCommand: '',
       disableCommand: '',
     })),
+    GetTunnelMode: vi.fn(async () => ({
+      mode: 'proxy' as const,
+      available: true,
+      requiresRestart: true,
+    })),
+    SetTunnelMode: vi.fn(async () => undefined),
     ListRelaysForDirectory: vi.fn(async () => ({
       count: 0,
       server_time: '2026-01-01T00:00:00Z',
@@ -97,7 +106,9 @@ describe('installNativeModules under Wails', () => {
     expect(service.Connect).toHaveBeenLastCalledWith('https://broker.example/', 'JP', 'relay_a');
 
     expect(await modules.OpenRungVpn!.getState()).toEqual({ status: 'disconnected' });
-    await expect(modules.OpenRungVpn!.setSplitTunnelConfig('{}')).resolves.toBeUndefined();
+    const splitConfig = '{"version":1,"enabled":true,"bypass_lan":true,"bypass_countries":["cn"]}';
+    await modules.OpenRungVpn!.setSplitTunnelConfig(splitConfig);
+    expect(service.SetSplitTunnelConfig).toHaveBeenLastCalledWith(splitConfig);
   });
 
   it('forwards Go state events to the app as the device event it listens for', () => {
@@ -130,7 +141,7 @@ describe('installNativeModules under Wails', () => {
   it('rejects broker features the desktop host does not implement with a coded error', async () => {
     fakeWails();
     installNativeModules();
-    await expect(modules.OpenRungBroker!.runSpeedTest()).rejects.toMatchObject({ code: 'unavailable' });
+    await expect(modules.OpenRungBroker!.fetchManifestCandidate()).rejects.toMatchObject({ code: 'unavailable' });
   });
 
   it('exposes the desktop host: version, proxy details, clipboard and external links', async () => {
@@ -143,6 +154,15 @@ describe('installNativeModules under Wails', () => {
 
     await modules.OpenRungDesktop!.copyText('127.0.0.1:4000');
     expect(runtime.ClipboardSetText).toHaveBeenCalledWith('127.0.0.1:4000');
+
+    // The capture mode is the host's to report and to change.
+    expect(await modules.OpenRungDesktop!.getTunnelMode()).toEqual({
+      mode: 'proxy',
+      available: true,
+      requiresRestart: true,
+    });
+    await modules.OpenRungDesktop!.setTunnelMode('tun');
+    expect(service.SetTunnelMode).toHaveBeenCalledWith('tun');
 
     // The webview must not navigate itself away from the app.
     await Linking.openURL('https://openrung.org/');

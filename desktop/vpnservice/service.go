@@ -13,6 +13,7 @@ package vpnservice
 
 import (
 	"context"
+	"io/fs"
 	"runtime"
 	"sync"
 	"time"
@@ -118,6 +119,15 @@ type Service struct {
 	// stays false for an OPENRUNG_SING_BOX external binary, which does not.
 	SingBoxStopsOnStdinClose bool
 
+	// Quit closes the app. Package main assigns it during startup; it is used
+	// when turning TUN mode on restarts the app elevated (see tunnelmode.go).
+	Quit func()
+
+	// RuleSets holds the bundled split-tunnel rule sets (geosite-<cc>.srs and
+	// geoip-<cc>.srs at its root). Startup stages them to disk; nil leaves
+	// the country presets unavailable.
+	RuleSets fs.FS
+
 	engine *connectcore.Engine
 	store  *clientstate.Store
 
@@ -137,6 +147,16 @@ type Service struct {
 	accessDenied      bool
 	enrollmentRefused bool
 	errorCode         string
+
+	// ruleSetDir is where Startup staged RuleSets, or empty when it could
+	// not. Written once, before any bound method runs.
+	ruleSetDir string
+
+	// splitMu guards the split-tunnel state below (see splittunnel.go). It is
+	// never held across an engine connect.
+	splitMu        sync.Mutex
+	splitSignature string
+	lastConnect    *connectRequest
 }
 
 func New() *Service {
@@ -158,6 +178,8 @@ func New() *Service {
 	engine.Sink = &engineSink{s: s}
 	engine.OSProxy = osProxyAdapter{ctrl: proxymode.New()}
 	engine.OSDNS = osDNSAdapter{ctrl: proxymode.NewDNS()}
+	// TUN mode is gated on this hook; proxy mode never invokes it.
+	engine.Elevation = elevation{s: s}
 	s.engine = engine
 	s.state = engine.State()
 	return s
@@ -180,6 +202,14 @@ func (s *Service) Startup(ctx context.Context) {
 		// The installation key enables per-user relay access (ADR-006); it
 		// is created in the same state directory on first use.
 		s.engine.Key = store.InstallationKey()
+	}
+	s.restoreTunnelMode()
+	if dir, err := ruleSetDirectory(); err != nil {
+		s.appendLog("split tunneling country presets unavailable: " + err.Error())
+	} else if err := stageRuleSets(s.RuleSets, dir); err != nil {
+		s.appendLog("split tunneling country presets unavailable: " + err.Error())
+	} else {
+		s.ruleSetDir = dir
 	}
 	// Crash recovery and persisted recents; the engine's log lines arrive
 	// through the sink.
@@ -217,6 +247,9 @@ func (s *Service) Prepare() (bool, error) {
 // targetCountry; empty strings stand in for the contract's nulls. It resolves
 // once the start has been dispatched — completion is reported via events.
 func (s *Service) Connect(brokerURL, targetCountry, targetRelayID string) error {
+	s.splitMu.Lock()
+	s.lastConnect = &connectRequest{brokerURL: brokerURL, targetCountry: targetCountry, targetRelayID: targetRelayID}
+	s.splitMu.Unlock()
 	return s.engine.Connect(brokerURL, targetCountry, targetRelayID)
 }
 

@@ -108,6 +108,11 @@ type connection struct {
 	done          chan struct{}
 	disconnecting bool // set under mu before cancel: a clean stop, not a crash
 	finalized     bool // set under mu once finalizeConn owns the terminal status
+	// ended is set under mu in the same critical section that publishes the
+	// terminal status: the tunnel is torn down and the OS setting restored,
+	// and only the terminal telemetry flush still holds the connection. From
+	// here nothing of this session reads the capture mode (see SetMode).
+	ended         bool
 	proxySet      bool // OS proxy may differ from the snapshot and still needs restore
 	snapshotTaken bool // snapshot captured once; survives a recovery proxy release
 	snapshot      OSProxySnapshot
@@ -495,6 +500,9 @@ type Engine struct {
 	// mode is the capture mode (see mode.go). Its zero value is ModeProxy, so
 	// a host that never calls SetMode keeps the pre-B3 behavior.
 	mode Mode
+	// splitTunnel is the desktop hosts' split-tunnel input (see
+	// splittunnel.go); nil means off.
+	splitTunnel *client.SplitTunnelRules
 
 	directory *directoryCache
 
@@ -1309,6 +1317,7 @@ func (s *Engine) attemptDirectCandidate(ctx context.Context, conn *connection, c
 func (s *Engine) candidateConfigInput(cand brokerapi.RelayDescriptor, port int) client.SingBoxConfigInput {
 	mode := s.Mode()
 	input := client.SingBoxConfigInput{Relay: cand, Mode: mode.inboundMode()}
+	s.applySplitTunnel(&input)
 	if mode == ModeTUN {
 		input.MTU = s.TunnelMTU
 		input.FakeIPCachePath = s.FakeIPCachePath
@@ -1766,7 +1775,8 @@ func (s *Engine) releaseProxy(conn *connection) bool {
 }
 
 // restoreOSSetting restores snap through the hook this session's mode uses.
-// The mode cannot change while a connection is live (see SetMode).
+// The mode cannot change before the session's terminal status (see SetMode),
+// and every restore of a session runs before that.
 func (s *Engine) restoreOSSetting(snap OSProxySnapshot) error {
 	if s.tunMode() {
 		if s.OSDNS == nil {
@@ -1835,6 +1845,7 @@ func (s *Engine) finalizeConn(conn *connection, stage string, err error) {
 		}
 		s.appendLog("disconnected")
 		s.mu.Lock()
+		conn.ended = true
 		s.emitStatusLocked(StatusDisconnected, clearLabel, clearError)
 		s.mu.Unlock()
 		conn.mgr.EndSession("disconnect")
@@ -1843,6 +1854,7 @@ func (s *Engine) finalizeConn(conn *connection, stage string, err error) {
 		msg := err.Error()
 		s.appendLog("connect failed: " + msg)
 		s.mu.Lock()
+		conn.ended = true
 		s.emitStatusLocked(StatusFailed, keepLabel, setError(msg))
 		s.mu.Unlock()
 		if conn.mgr != nil {

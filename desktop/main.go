@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"runtime"
@@ -21,6 +22,12 @@ import (
 
 //go:embed all:frontend/dist
 var assets embed.FS
+
+// The split-tunnel country presets' rule sets, which this app shares with the
+// mobile apps through the submodule that also carries the UI source.
+//
+//go:embed mobile-app/rulesets/dist/*.srs
+var ruleSetAssets embed.FS
 
 func main() {
 	// If this process was launched from a shell using OpenRung's helper, remove
@@ -48,6 +55,9 @@ func main() {
 	}
 
 	svc := vpnservice.New()
+	if ruleSets, err := fs.Sub(ruleSetAssets, "mobile-app/rulesets/dist"); err == nil {
+		svc.RuleSets = ruleSets
+	}
 	// The engine's sing-box child process is this executable (singbox.go), so
 	// there is no external binary to hunt for on a PATH a Finder-launched .app
 	// never had. OPENRUNG_SING_BOX overrides that with an external binary —
@@ -76,6 +86,14 @@ func main() {
 		}
 	}
 
+	// An instance started elevated for TUN mode lets the one that started it
+	// finish quitting; an instance whose stored mode is TUN but which lacks
+	// the rights starts that elevated instance and ends here.
+	vpnservice.WaitForRelaunchParent(os.Args[1:])
+	if svc.RelaunchForTUN(context.Background(), os.Args[1:]) {
+		return
+	}
+
 	err := wails.Run(&options.App{
 		Title:            "OpenRung",
 		Width:            phoneWindowWidth,
@@ -90,6 +108,7 @@ func main() {
 			svc.Emitter = func(state vpnservice.NativeVpnState) {
 				wailsruntime.EventsEmit(ctx, "openrungStateChanged", state)
 			}
+			svc.Quit = func() { wailsruntime.Quit(ctx) }
 			svc.Startup(ctx)
 		},
 		OnShutdown: func(ctx context.Context) {
